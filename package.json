@@ -1,36 +1,12 @@
 {
-  "name": "eldercare-dashboard",
+  "name": "elevenlabs-twilio-bridge",
   "version": "1.0.0",
-  "private": true,
+  "main": "server.js",
   "scripts": {
-    "dev": "next dev",
-    "websocket": "node app/api/websocket/route.js",
-    "start:all": "concurrently \"npm run dev\" \"npm run websocket\"",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint"
+    "start": "node server.js"
   },
   "dependencies": {
-    "@headlessui/react": "^2.2.4",
-    "@heroicons/react": "^2.2.0",
-    "@next/font": "^14.2.15",
-    "@supabase/supabase-js": "^2.52.0",
-    "@types/node": "^22.13.11",
-    "autoprefixer": "^10.4.21",
-    "clsx": "^2.1.1",
-    "concurrently": "^9.2.0",
-    "date-fns": "^4.1.0",
-    "framer-motion": "^12.23.6",
-    "jspdf": "^3.0.1",
-    "jspdf-autotable": "^5.0.2",
-    "lucide-react": "^0.525.0",
-    "next": "^15.4.2",
-    "node-fetch": "^3.3.2",
-    "postcss": "^8.5.6",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0",
-    "recharts": "^3.1.0",
-    "tailwindcss": "^3.4.17",
     "ws": "^8.18.3"
   }
 }
+›
