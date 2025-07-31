@@ -169,16 +169,18 @@ wss.on('connection', (twilioWs, request) => {
           break
 
         case 'media':
-          if (elevenLabsWs?.readyState === WebSocket.OPEN && message.media?.payload) {
-            // ElevenLabs expects audio in a specific format
-            // Twilio sends mulaw audio as base64, we need to send it properly formatted
-            const audioMessage = {
-              type: 'audio',
-              audio_event: {
-                audio_base_64: message.media.payload,
-                // ElevenLabs expects these additional fields for proper audio handling
-                sample_rate: 8000, // Twilio default
-                encoding: 'mulaw'   // Twilio's audio format
+  if (elevenLabsWs?.readyState === WebSocket.OPEN && message.media?.payload) {
+    // ElevenLabs expects this specific format
+    const audioMessage = {
+      user_audio_chunk: {
+        audio_base_64: message.media.payload,
+        encoding: "mulaw",
+        sample_rate: 8000
+      }
+    }
+    
+    elevenLabsWs.send(JSON.stringify(audioMessage))
+    console.log('🎤 Sent audio chunk to ElevenLabs')
               }
             }
             
