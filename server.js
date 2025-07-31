@@ -170,7 +170,6 @@ wss.on('connection', (twilioWs, request) => {
 
         case 'media':
   if (elevenLabsWs?.readyState === WebSocket.OPEN && message.media?.payload) {
-    // ElevenLabs expects this specific format
     const audioMessage = {
       user_audio_chunk: {
         audio_base_64: message.media.payload,
@@ -181,19 +180,8 @@ wss.on('connection', (twilioWs, request) => {
     
     elevenLabsWs.send(JSON.stringify(audioMessage))
     console.log('🎤 Sent audio chunk to ElevenLabs')
-              }
-            }
-            
-            // Alternative simpler format that ElevenLabs might accept
-            const simpleAudioMessage = {
-              user_audio_chunk: message.media.payload
-            }
-            
-            // Try the simpler format first as it's more commonly used
-            elevenLabsWs.send(JSON.stringify(simpleAudioMessage))
-            console.log('🎤 Sent audio chunk to ElevenLabs')
-          }
-          break
+  }
+  break
 
         case 'stop':
           console.log('🔌 Twilio stream stopped')
