@@ -13,6 +13,7 @@ const server = http.createServer((req, res) => {
   <Connect>
     <Stream url="wss://${process.env.RAILWAY_PUBLIC_DOMAIN}">
       <Parameter name="codec" value="audio/l16;rate=16000"/>
+      <Parameter name="debug" value="true"/>
     </Stream>
   </Connect>
 </Response>`
@@ -99,8 +100,10 @@ wss.on('connection', (twilioWs) => {
       if (msg.event === 'media' && msg.media?.payload) {
         const audioMsg = JSON.stringify({ user_audio_chunk: msg.media.payload })
         if (elevenlabsReady && elevenLabsWs?.readyState === WebSocket.OPEN) {
+          console.log('🔊 Forwarding audio chunk to ElevenLabs')
           elevenLabsWs.send(audioMsg)
         } else {
+          console.log('🛑 Buffering audio chunk, ElevenLabs not ready')
           audioBuffer.push(audioMsg)
         }
       }
@@ -126,4 +129,3 @@ const PORT = process.env.PORT || 5000
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 WebSocket bridge running on port ${PORT}`)
 })
-
