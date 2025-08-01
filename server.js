@@ -202,26 +202,22 @@ wss.on('connection', (twilioWs, request) => {
           break
 
         case 'media':
-          if (elevenLabsWs?.readyState === WebSocket.OPEN && message.media?.payload) {
-            const audioMessage = {
-              user_audio_chunk: {
-                audio_base_64: message.media.payload,
-                encoding: "mulaw",
-                sample_rate: 8000
-              }
-            }
-            
-            elevenLabsWs.send(JSON.stringify(audioMessage))
-            // Only log every 10th audio message to reduce spam
-            if (Math.random() < 0.1) {
-              console.log('🎤 Sent audio chunk to ElevenLabs (payload length:', message.media.payload.length, ')')
-            }
-          } else if (!elevenLabsWs) {
-            console.log('❌ ElevenLabs not connected yet - dropping audio')
-          } else if (elevenLabsWs.readyState !== WebSocket.OPEN) {
-            console.log('❌ ElevenLabs WebSocket not ready - state:', elevenLabsWs.readyState)
-          }
-          break
+  if (elevenLabsWs?.readyState === WebSocket.OPEN && message.media?.payload) {
+    const audioMessage = {
+      user_audio_chunk: message.media.payload
+    }
+    
+    elevenLabsWs.send(JSON.stringify(audioMessage))
+    // Only log every 10th audio message to reduce spam
+    if (Math.random() < 0.1) {
+      console.log('🎤 Sent audio chunk to ElevenLabs (payload length:', message.media.payload.length, ')')
+    }
+  } else if (!elevenLabsWs) {
+    console.log('❌ ElevenLabs not connected yet - dropping audio')
+  } else if (elevenLabsWs.readyState !== WebSocket.OPEN) {
+    console.log('❌ ElevenLabs WebSocket not ready - state:', elevenLabsWs.readyState)
+  }
+  break
 
         case 'stop':
           console.log('🔌 Twilio stream stopped')
