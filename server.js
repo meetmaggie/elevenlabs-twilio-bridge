@@ -109,6 +109,11 @@ wss.on('connection', (twilioWs, request) => {
 
       elevenLabsWs.on('message', (data) => {
         try {
+          // 🔍 NEW AUDIO DEBUG LOGS - RECEIVING FROM ELEVENLABS
+          console.log('🔍 RAW ElevenLabs data type:', typeof data);
+          console.log('🔍 RAW ElevenLabs data length:', data.length);
+          console.log('🔍 First 100 chars of ElevenLabs data:', data.toString().substring(0, 100));
+
           const message = JSON.parse(data.toString())
           console.log('📨 ElevenLabs message type:', message.type)
           console.log('📋 Full ElevenLabs message:', JSON.stringify(message, null, 2))
@@ -129,6 +134,11 @@ wss.on('connection', (twilioWs, request) => {
             case 'audio':
               console.log('🔊 Received audio from ElevenLabs')
               if (twilioWs.readyState === WebSocket.OPEN && streamSid && message.audio_event?.audio_base_64) {
+                // 🔍 NEW AUDIO DEBUG LOGS - SENDING TO TWILIO
+                console.log('🔍 Audio payload type:', typeof message.audio_event.audio_base_64);
+                console.log('🔍 Audio payload length:', message.audio_event.audio_base_64.length);
+                console.log('🔍 First 50 chars of audio payload:', message.audio_event.audio_base_64.substring(0, 50));
+
                 const audioMessage = {
                   event: 'media',
                   streamSid: streamSid,
@@ -136,10 +146,17 @@ wss.on('connection', (twilioWs, request) => {
                     payload: message.audio_event.audio_base_64
                   }
                 }
+
+                // 🔍 DEBUG THE COMPLETE MESSAGE TO TWILIO
+                console.log('🔍 Complete Twilio message structure:', JSON.stringify(audioMessage, null, 2));
+
                 twilioWs.send(JSON.stringify(audioMessage))
                 console.log('🔊 Sent audio to Twilio')
               } else {
                 console.log('❌ Cannot send audio to Twilio - connection issue')
+                console.log('❌ Twilio ready:', twilioWs.readyState === WebSocket.OPEN)
+                console.log('❌ StreamSid present:', !!streamSid)
+                console.log('❌ Audio data present:', !!message.audio_event?.audio_base_64)
               }
               break
 
@@ -228,6 +245,11 @@ wss.on('connection', (twilioWs, request) => {
 
         case 'media':
           if (elevenLabsWs?.readyState === WebSocket.OPEN && message.media?.payload) {
+            // 🔍 NEW AUDIO DEBUG LOGS - RECEIVING FROM TWILIO
+            console.log('🔍 Twilio audio payload type:', typeof message.media.payload);
+            console.log('🔍 Twilio audio payload length:', message.media.payload.length);
+            console.log('🔍 First 50 chars from Twilio:', message.media.payload.substring(0, 50));
+
             const audioMessage = {
               user_audio_chunk: message.media.payload
             }
