@@ -1,4 +1,3 @@
-
 const { WebSocketServer } = require('ws')
 const WebSocket = require('ws')
 // Use dynamic import for node-fetch v3 compatibility
@@ -8,10 +7,22 @@ let fetch;
 })();
 const http = require('http')
 
-// Create HTTP server
+// Create HTTP server with TwiML endpoint
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' })
-  res.end('ElevenLabs-Twilio WebSocket Bridge Running')
+  if (req.url === '/twiml' && req.method === 'POST') {
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="wss://elevenlabs-twilio-bridge-production-95ab.up.railway.app" />
+  </Connect>
+</Response>`
+    
+    res.writeHead(200, { 'Content-Type': 'application/xml' })
+    res.end(twiml)
+  } else {
+    res.writeHead(200, { 'Content-Type': 'text/plain' })
+    res.end('ElevenLabs-Twilio WebSocket Bridge Running')
+  }
 })
 
 // Create WebSocket server
@@ -23,7 +34,6 @@ wss.on('connection', (twilioWs, request) => {
   console.log('📞 New Twilio WebSocket connection established!')
   console.log('🔗 Connection URL:', request.url)
   console.log('🌐 Client IP:', request.socket.remoteAddress)
-  console.log('📋 Headers:', request.headers)
 
   let elevenLabsWs = null
   let streamSid = null
@@ -38,6 +48,8 @@ wss.on('connection', (twilioWs, request) => {
 
       if (!agentId || !apiKey) {
         console.error('❌ Missing ElevenLabs credentials')
+        console.error('❌ Agent ID:', agentId ? 'Present' : 'Missing')
+        console.error('❌ API Key:', apiKey ? 'Present' : 'Missing')
         return
       }
 
@@ -66,32 +78,33 @@ wss.on('connection', (twilioWs, request) => {
 
       elevenLabsWs.on('open', () => {
         console.log('✅ Connected to ElevenLabs agent')
-
-        // Send conversation initiation
-        const initMessage = {
-          type: 'conversation_initiation_client_data',
-          conversation_initiation_client_data: {
-            user_name: 'James',
-            is_first_call: true,
-            conversation_type: 'discovery'
-          }
-        }
-        console.log('📤 Sending conversation initiation...')
-        elevenLabsWs.send(JSON.stringify(initMessage))
       })
 
       elevenLabsWs.on('message', (data) => {
         try {
           const message = JSON.parse(data.toString())
-          console.log('📨 ElevenLabs message:', message.type)
+          console.log('📨 ElevenLabs message type:', message.type)
+          console.log('📋 Full ElevenLabs message:', JSON.stringify(message, null, 2))
 
           switch (message.type) {
             case 'conversation_initiation_metadata':
               conversationId = message.conversation_initiation_metadata_event?.conversation_id
               console.log('✅ ElevenLabs conversation initiated:', conversationId)
+              
+              // Send initial greeting after conversation starts
+              const greetingMessage = {
+                user_audio_chunk: {
+                  audio_base_64: "",
+                  encoding: "mulaw", 
+                  sample_rate: 8000
+                }
+              }
+              elevenLabsWs.send(JSON.stringify(greetingMessage))
+              console.log('👋 Sent greeting to start conversation')
               break
 
             case 'audio':
+              console.log('🔊 Received audio from ElevenLabs')
               if (twilioWs.readyState === WebSocket.OPEN && streamSid && message.audio_event?.audio_base_64) {
                 const audioMessage = {
                   event: 'media',
@@ -102,10 +115,13 @@ wss.on('connection', (twilioWs, request) => {
                 }
                 twilioWs.send(JSON.stringify(audioMessage))
                 console.log('🔊 Sent audio to Twilio')
+              } else {
+                console.log('❌ Cannot send audio to Twilio - connection issue')
               }
               break
 
             case 'interruption':
+              console.log('🛑 ElevenLabs interruption received')
               if (twilioWs.readyState === WebSocket.OPEN && streamSid) {
                 const clearMessage = {
                   event: 'clear',
@@ -117,7 +133,7 @@ wss.on('connection', (twilioWs, request) => {
               break
 
             case 'ping':
-              // Respond to ping with pong including required event_id
+              console.log('🏓 ElevenLabs ping received')
               if (elevenLabsWs.readyState === WebSocket.OPEN) {
                 const eventId = message.event_id || `pong_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
                 const pongMessage = {
@@ -135,22 +151,38 @@ wss.on('connection', (twilioWs, request) => {
                 twilioWs.close()
               }
               break
+
+            default:
+              console.log('📋 Other ElevenLabs message type:', message.type)
+              break
           }
         } catch (error) {
           console.error('❌ Error processing ElevenLabs message:', error)
+          console.error('❌ Raw message data:', data.toString().substring(0, 200))
         }
       })
 
       elevenLabsWs.on('error', (error) => {
         console.error('❌ ElevenLabs WebSocket error:', error)
+        console.error('❌ Error stack:', error.stack)
       })
 
       elevenLabsWs.on('close', (code, reason) => {
         console.log('🔌 ElevenLabs WebSocket closed:', code, reason.toString())
+        const meanings = {
+          1000: 'Normal closure',
+          1001: 'Going away', 
+          1002: 'Protocol error',
+          1003: 'Unsupported data',
+          1008: 'Policy violation',
+          1011: 'Internal error'
+        }
+        console.log('📋 Close reason:', meanings[code] || `Unknown: ${code}`)
       })
 
     } catch (error) {
       console.error('❌ Failed to connect to ElevenLabs:', error)
+      console.error('❌ Error stack:', error.stack)
     }
   }
 
@@ -164,24 +196,32 @@ wss.on('connection', (twilioWs, request) => {
         case 'start':
           streamSid = message.start.streamSid
           console.log('✅ Twilio stream started:', streamSid)
-          console.log('📋 Media format:', message.start.mediaFormat)
+          console.log('📋 Media format:', JSON.stringify(message.start.mediaFormat))
+          console.log('🚀 INITIATING ELEVENLABS CONNECTION NOW!')
           connectToElevenLabs()
           break
 
         case 'media':
-  if (elevenLabsWs?.readyState === WebSocket.OPEN && message.media?.payload) {
-    const audioMessage = {
-      user_audio_chunk: {
-        audio_base_64: message.media.payload,
-        encoding: "mulaw",
-        sample_rate: 8000
-      }
-    }
-    
-    elevenLabsWs.send(JSON.stringify(audioMessage))
-    console.log('🎤 Sent audio chunk to ElevenLabs')
-  }
-  break
+          if (elevenLabsWs?.readyState === WebSocket.OPEN && message.media?.payload) {
+            const audioMessage = {
+              user_audio_chunk: {
+                audio_base_64: message.media.payload,
+                encoding: "mulaw",
+                sample_rate: 8000
+              }
+            }
+            
+            elevenLabsWs.send(JSON.stringify(audioMessage))
+            // Only log every 10th audio message to reduce spam
+            if (Math.random() < 0.1) {
+              console.log('🎤 Sent audio chunk to ElevenLabs (payload length:', message.media.payload.length, ')')
+            }
+          } else if (!elevenLabsWs) {
+            console.log('❌ ElevenLabs not connected yet - dropping audio')
+          } else if (elevenLabsWs.readyState !== WebSocket.OPEN) {
+            console.log('❌ ElevenLabs WebSocket not ready - state:', elevenLabsWs.readyState)
+          }
+          break
 
         case 'stop':
           console.log('🔌 Twilio stream stopped')
@@ -189,9 +229,14 @@ wss.on('connection', (twilioWs, request) => {
             elevenLabsWs.close()
           }
           break
+
+        default:
+          console.log('📋 Other Twilio message:', message.event)
+          break
       }
     } catch (error) {
       console.error('❌ Error processing Twilio message:', error)
+      console.error('❌ Raw message:', data.toString().substring(0, 200))
     }
   })
 
@@ -204,7 +249,6 @@ wss.on('connection', (twilioWs, request) => {
 
   twilioWs.on('error', (error) => {
     console.error('❌ Twilio WebSocket error:', error)
-    console.error('❌ Error details:', error.message)
   })
 })
 
