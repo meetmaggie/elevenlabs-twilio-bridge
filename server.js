@@ -38,6 +38,8 @@ wss.on('connection', (twilioWs, request) => {
   let elevenLabsWs = null
   let streamSid = null
   let conversationId = null
+  let audioBuffer = []
+  let elevenlabsReady = false
 
   const connectToElevenLabs = async () => {
     try {
@@ -105,6 +107,14 @@ wss.on('connection', (twilioWs, request) => {
       elevenLabsWs.on('open', () => {
         console.log('✅ Connected to ElevenLabs agent')
         console.log('🔌 WebSocket state:', elevenLabsWs.readyState)
+        elevenlabsReady = true
+        
+        // Send any buffered audio
+        console.log(`📦 Sending ${audioBuffer.length} buffered audio packets`)
+        audioBuffer.forEach(audio => {
+          elevenLabsWs.send(audio)
+        })
+        audioBuffer = [] // Clear buffer
       })
 
       elevenLabsWs.on('message', (data) => {
@@ -244,7 +254,7 @@ wss.on('connection', (twilioWs, request) => {
           break
 
         case 'media':
-          if (elevenLabsWs?.readyState === WebSocket.OPEN && message.media?.payload) {
+          if (elevenlabsReady && elevenLabsWs?.readyState === WebSocket.OPEN && message.media?.payload) {
             // 🔍 NEW AUDIO DEBUG LOGS - RECEIVING FROM TWILIO
             console.log('🔍 Twilio audio payload type:', typeof message.media.payload);
             console.log('🔍 Twilio audio payload length:', message.media.payload.length);
@@ -259,10 +269,25 @@ wss.on('connection', (twilioWs, request) => {
             if (Math.random() < 0.1) {
               console.log('🎤 Sent audio chunk to ElevenLabs (payload length:', message.media.payload.length, ')')
             }
-          } else if (!elevenLabsWs) {
-            console.log('❌ ElevenLabs not connected yet - dropping audio')
+          } else if (!elevenlabsReady || !elevenLabsWs) {
+            // Buffer audio until ElevenLabs is ready
+            console.log('📦 Buffering audio packet (ElevenLabs not ready)')
+            if (message.media?.payload) {
+              const audioMessage = {
+                user_audio_chunk: message.media.payload
+              }
+              audioBuffer.push(JSON.stringify(audioMessage))
+            }
           } else if (elevenLabsWs.readyState !== WebSocket.OPEN) {
             console.log('❌ ElevenLabs WebSocket not ready - state:', elevenLabsWs.readyState)
+            // Also buffer this audio
+            if (message.media?.payload) {
+              console.log('📦 Buffering audio packet (WebSocket not open)')
+              const audioMessage = {
+                user_audio_chunk: message.media.payload
+              }
+              audioBuffer.push(JSON.stringify(audioMessage))
+            }
           }
           break
 
