@@ -71,6 +71,9 @@ wss.on('connection', (twilioWs) => {
       try {
         const msg = JSON.parse(data.toString())
 
+        // ✅ Add this debug log to see if ElevenLabs is replying at all
+        console.log('📩 Message from ElevenLabs:', msg)
+
         if (msg.type === 'audio' && msg.audio_event?.audio_base_64 && twilioWs.readyState === WebSocket.OPEN) {
           const twilioMsg = {
             event: 'media',
