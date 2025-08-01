@@ -58,6 +58,11 @@ wss.on('connection', (twilioWs) => {
     elevenLabsWs.on('open', () => {
       console.log('✅ Connected to ElevenLabs agent')
       elevenlabsReady = true
+
+      // 👇 FIX: Tell ElevenLabs you're ready to speak
+      elevenLabsWs.send(JSON.stringify({ user_audio_chunk: "" }))
+      console.log('🟢 Sent initial empty audio chunk to ElevenLabs')
+
       audioBuffer.forEach(audio => elevenLabsWs.send(audio))
       audioBuffer = []
     })
