@@ -1,12 +1,7 @@
 {
-  "name": "elevenlabs-twilio-bridge",
-  "version": "1.0.0",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "ws": "^8.18.3",
-     "node-fetch": "^3.3.0"
-  }
+  "name": "twilio-ws-bridge",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": { "ws": "8.14.2" },
+  "scripts": { "start": "node server.js" }
 }
