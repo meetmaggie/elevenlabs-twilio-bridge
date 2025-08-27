@@ -35,8 +35,18 @@ wss.on('connection', (ws) => {
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
-  if (pathname !== '/ws') return socket.destroy();
-  if (AUTH_TOKEN && query.token !== AUTH_TOKEN) return socket.destroy();
+  console.log('[UPGRADE] path:', pathname, ' tokenPresent:', !!query?.token);
+
+  if (pathname !== '/ws') {
+    console.log('[UPGRADE] rejected — wrong path:', pathname);
+    socket.destroy();
+    return;
+  }
+  if (AUTH_TOKEN && query.token !== AUTH_TOKEN) {
+    console.log('[UPGRADE] rejected — BAD TOKEN. Got:', (query.token || '').slice(0,6)+'...');
+    socket.destroy();
+    return;
+  }
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
