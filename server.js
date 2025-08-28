@@ -2,7 +2,6 @@
 // Requires Node 18+ (global fetch). Set env:
 //  BRIDGE_AUTH_TOKEN, ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID (default)
 //  (optional) DEBUG_AUDIO=1
-//  (optional) INTRO_DELAY_MS=2000   // how long to mute EL→Twilio at start
 
 const http = require('http');
 const url = require('url');
@@ -12,7 +11,6 @@ const PORT = process.env.PORT || 8080;
 const BRIDGE_AUTH_TOKEN   = process.env.BRIDGE_AUTH_TOKEN || '';
 const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY || '';
 const DEFAULT_AGENT_ID    = process.env.ELEVENLABS_AGENT_ID || process.env.ELEVENLABS_DISCOVERY_AGENT_ID || '';
-const INTRO_DELAY_MS      = parseInt(process.env.INTRO_DELAY_MS || '2000', 10);
 
 if (!BRIDGE_AUTH_TOKEN || !ELEVENLABS_API_KEY || !DEFAULT_AGENT_ID) {
   console.error('[BOOT] Missing env: BRIDGE_AUTH_TOKEN / ELEVENLABS_API_KEY / ELEVENLABS_AGENT_ID');
@@ -109,32 +107,6 @@ wss.on('connection', async (twilioWs, req) => {
   let agentId = DEFAULT_AGENT_ID;
   let elWs = null;
 
-  // --- Option A: "initial mute" state ---------------------------------------
-  let allowOutbound = false;           // gate for EL->Twilio audio
-  let introTimer = null;               // timer handle
-  let callActive = true;               // used to avoid talking after hangup
-
-  function startIntroDelay() {
-    if (introTimer) return; // already set
-    console.log(`[DELAY] Muting EL→Twilio for ${INTRO_DELAY_MS}ms at call start`);
-    allowOutbound = false;
-    introTimer = setTimeout(() => {
-      introTimer = null;
-      if (!callActive) return;
-      allowOutbound = true;
-      console.log('[DELAY] Initial mute finished — allowing EL→Twilio audio');
-      // Note: If EL already tried to greet during mute, that audio is dropped.
-      // The next EL utterance will pass through normally.
-    }, INTRO_DELAY_MS);
-  }
-
-  function clearIntroDelay() {
-    if (introTimer) {
-      clearTimeout(introTimer);
-      introTimer = null;
-    }
-  }
-
   async function ensureEl() {
     if (elWs) return;
     try {
@@ -152,26 +124,18 @@ wss.on('connection', async (twilioWs, req) => {
       // audio back to Twilio phone (PCMU μ-law 8k base64 required)
       const b64 = pickElAudioB64(msg);
       if (b64 && streamSid) {
-        // Gate outbound audio until initial delay finishes
-        if (!allowOutbound) {
-          if (process.env.DEBUG_AUDIO === '1') {
-            console.log('[EL->TWILIO] (dropped due to initial mute window)');
-          }
-        } else {
-          twilioWs.send(JSON.stringify({
-            event: 'media',
-            streamSid,
-            media: { payload: b64 }
-          }));
-          if (process.env.DEBUG_AUDIO === '1') {
-            console.log(`[EL->TWILIO] ${Math.round(b64.length / 1024)}KB base64`);
-          }
+        twilioWs.send(JSON.stringify({
+          event: 'media',
+          streamSid,
+          media: { payload: b64 }
+        }));
+        if (process.env.DEBUG_AUDIO === '1') {
+          console.log(`[EL->TWILIO] ${Math.round(b64.length / 1024)}KB base64`);
         }
       }
 
       // barge-in
-      if (msg.type === 'interruption' && streamSid && allowOutbound) {
-        // Only clear if we are already allowing audio through
+      if (msg.type === 'interruption' && streamSid) {
         twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
       }
 
@@ -211,9 +175,6 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       console.log(`[WS] start; streamSid = ${streamSid} agent = (default) → ${agentId}`);
-      // Kick off initial mute window BEFORE connecting EL (so early audio is dropped)
-      startIntroDelay();
-
       await ensureEl();
       return;
     }
@@ -229,8 +190,6 @@ wss.on('connection', async (twilioWs, req) => {
 
     if (msg.event === 'stop') {
       console.log('[WS] stop');
-      callActive = false;
-      clearIntroDelay();
       try { elWs?.close(1000, 'stop'); } catch {}
       try { twilioWs.close(1000, 'stop'); } catch {}
       return;
@@ -239,20 +198,14 @@ wss.on('connection', async (twilioWs, req) => {
 
   twilioWs.on('close', (code, reason) => {
     console.log('[WS] closed:', code, reason?.toString() || '');
-    callActive = false;
-    clearIntroDelay();
     try { elWs?.close(code, reason); } catch {}
   });
 
-  twilioWs.on('error', (e) => {
-    console.error('[WS] error', e?.message || e);
-    // On error, be safe and stop the timer
-    callActive = false;
-    clearIntroDelay();
-  });
+  twilioWs.on('error', (e) => console.error('[WS] error', e?.message || e));
 });
 
 server.listen(PORT, () => console.log(`[HTTP] listening on :${PORT}`));
+
 
 
 
