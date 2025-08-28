@@ -1,168 +1,201 @@
-// server.js — Twilio Media Streams ⇄ ElevenLabs Agent (with agent switching + robust connect)
-'use strict';
+// server.js — ElevenLabs <-> Twilio bridge (robust EL->Twilio audio handling)
 const http = require('http');
 const url = require('url');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
-const BRIDGE_AUTH_TOKEN = process.env.BRIDGE_AUTH_TOKEN || '';
-const XI_API_KEY = process.env.ELEVENLABS_API_KEY || '';
+const BRIDGE_AUTH_TOKEN   = process.env.BRIDGE_AUTH_TOKEN;       // must match the <Parameter token="..."> you send in TwiML
+const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID || process.env.ELEVENLABS_DISCOVERY_AGENT_ID;
 
-// Agent envs — you can set any/all of these in Railway
-const AGENT_DEFAULT   = process.env.ELEVENLABS_AGENT_ID || '';
-const AGENT_DISCOVERY = process.env.ELEVENLABS_DISCOVERY_AGENT_ID || '';
-const AGENT_DAILY     = process.env.ELEVENLABS_DAILY_AGENT_ID || '';
-
-function pickAgent(agentParam) {
-  const a = String(agentParam || '').toLowerCase();
-  if (a === 'daily' && AGENT_DAILY) return AGENT_DAILY;
-  if (a === 'discovery' && AGENT_DISCOVERY) return AGENT_DISCOVERY;
-  // fallback order: default, discovery, daily
-  return AGENT_DEFAULT || AGENT_DISCOVERY || AGENT_DAILY || '';
+if (!BRIDGE_AUTH_TOKEN || !ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
+  console.error('[BOOT] Missing env BRIDGE_AUTH_TOKEN / ELEVENLABS_API_KEY / ELEVENLABS_AGENT_ID');
 }
 
-if (!XI_API_KEY) {
-  console.error('[BOOT] Missing ELEVENLABS_API_KEY');
-}
-
-// -------- helpers --------
-function safeSend(ws, data){ if (ws && ws.readyState === WebSocket.OPEN) { try{ ws.send(data);}catch{} } }
-function errMsg(e){ return (e && e.message) ? e.message : String(e); }
-
-async function getSignedUrl(agentId) {
-  const endpoint = `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(agentId)}`;
-  const res = await fetch(endpoint, { headers: { 'xi-api-key': XI_API_KEY } });
-  const body = await res.text();
-  if (!res.ok) throw new Error(`[EL] get-signed-url failed: ${res.status} ${body}`);
-  const json = JSON.parse(body || '{}');
-  if (!json.signed_url) throw new Error('[EL] signed_url missing');
-  return json.signed_url;
-}
-
-function openDirect(agentId) {
-  const direct = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(agentId)}`;
-  return new WebSocket(direct, { headers: { 'xi-api-key': XI_API_KEY } });
-}
-
-async function connectEleven(agentId) {
-  try {
-    const signed = await getSignedUrl(agentId);
-    console.log('[EL] got signed_url');
-    return await new Promise((resolve, reject) => {
-      const ws = new WebSocket(signed);
-      ws.on('open', () => { console.log('[EL] connected (signed)'); resolve(ws); });
-      ws.on('error', e => { console.error('[EL] error (signed):', errMsg(e)); reject(e); });
-    });
-  } catch (e) {
-    console.warn('[EL] signed-url failed; falling back to direct WSS');
-    return await new Promise((resolve, reject) => {
-      const ws = openDirect(agentId);
-      ws.on('open', () => { console.log('[EL] connected (direct)'); resolve(ws); });
-      ws.on('error', e => { console.error('[EL] error (direct):', errMsg(e)); reject(e); });
-    });
-  }
-}
-
-// -------- HTTP --------
 const server = http.createServer((req, res) => {
-  if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
-    res.writeHead(200, {'Content-Type':'text/plain'}); return res.end('ok');
+  const { pathname } = url.parse(req.url);
+  if (pathname === '/' || pathname === '/health') {
+    res.writeHead(200, {'content-type':'text/plain'}); res.end('ok');
+  } else if (pathname === '/test') {
+    res.writeHead(200, {'content-type':'application/json'}); res.end(JSON.stringify({ok:true,ts:Date.now()}));
+  } else {
+    res.writeHead(404); res.end('not found');
   }
-  if (req.method === 'GET' && req.url === '/test') {
-    res.writeHead(200, {'Content-Type':'application/json'});
-    return res.end(JSON.stringify({ok:true, ts:Date.now()}));
-  }
-  res.writeHead(404); res.end('not found');
 });
 
-// -------- WS --------
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
-  console.log('[UPGRADE] path:', pathname);
-  if (pathname !== '/ws' && pathname !== '/ws/') { console.log('[UPGRADE] rejected — wrong path'); return socket.destroy(); }
-  const qToken = query?.token;
-  if (qToken && BRIDGE_AUTH_TOKEN && qToken !== BRIDGE_AUTH_TOKEN) { console.log('[UPGRADE] rejected — BAD TOKEN (query)'); return socket.destroy(); }
-  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req, qToken));
+  if (pathname !== '/ws') return socket.destroy();
+
+  // optional early reject if a query token is present but wrong
+  if (query?.token && query.token !== BRIDGE_AUTH_TOKEN) {
+    console.warn('[UPGRADE] rejected — BAD TOKEN via query');
+    return socket.destroy();
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
-wss.on('connection', (twilioWs, req, tokenFromQuery) => {
-  console.log('[WS] connected from', req.socket.remoteAddress);
-  let authorized = !!tokenFromQuery || !BRIDGE_AUTH_TOKEN;
-  let elevenWs = null;
-  let streamSid = null;
-  let closed = false;
-
-  function closeBoth(code=1000, reason='normal'){
-    if (closed) return; closed = true;
-    try { twilioWs.close(code, reason); } catch {}
-    try { elevenWs && elevenWs.close(code, reason); } catch {}
+// Helper: pull a base64 audio string from any EL message shape
+function pickElAudioB64(msg) {
+  const cands = [
+    msg?.audio,                               // many SDKs
+    msg?.audio_base64,
+    msg?.audio_base_64,
+    msg?.audio_event?.audio,                  // some convo SDKs
+    msg?.audio_event?.audio_base64,
+    msg?.audio_event?.audio_base_64,
+    msg?.tts_event?.audio_base_64,
+    msg?.response?.audio,
+    msg?.chunk?.audio
+  ];
+  for (const s of cands) {
+    if (typeof s === 'string' && s.length > 32) return s;
   }
-
-  async function handleStart(msg){
-    streamSid = msg?.start?.streamSid || null;
-
-    const cp = msg?.start?.customParameters || {};
-    const token = cp.token || '';
-    const agentParam = cp.agent || '';
-
-    if (!authorized) {
-      if (BRIDGE_AUTH_TOKEN && token === BRIDGE_AUTH_TOKEN) {
-        authorized = true; console.log('[WS] start: token accepted via customParameters');
-      } else { console.log('[WS] start: BAD/MISSING token — closing'); return closeBoth(1008, 'unauthorized'); }
+  // last resort: walk one level deep and grab a long base64-ish string
+  for (const [k, v] of Object.entries(msg || {})) {
+    if (typeof v === 'string' && v.length > 128 && /^[A-Za-z0-9+/=]+$/.test(v)) return v;
+    if (v && typeof v === 'object') {
+      for (const [k2, v2] of Object.entries(v)) {
+        if (typeof v2 === 'string' && v2.length > 128 && /^[A-Za-z0-9+/=]+$/.test(v2)) return v2;
+      }
     }
+  }
+  return null;
+}
 
-    const agentId = pickAgent(agentParam);
-    console.log('[WS] start; streamSid =', streamSid, 'agent =', agentParam || '(default)', '→', agentId || '(none)');
+async function connectEleven(agentId) {
+  // Prefer signed URL; fall back to direct WSS if needed
+  try {
+    const signedResp = await fetch(
+      `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${encodeURIComponent(agentId)}`,
+      { headers: { 'xi-api-key': ELEVENLABS_API_KEY } }
+    );
+    if (!signedResp.ok) throw new Error(`[EL] get-signed-url failed: ${signedResp.status}`);
+    const { signed_url } = await signedResp.json();
+    const ws = new WebSocket(signed_url);
+    return await new Promise((resolve, reject) => {
+      ws.once('open', () => { console.log('[EL] connected (signed)'); resolve(ws); });
+      ws.once('error', (e) => reject(e));
+    });
+  } catch (e) {
+    console.warn('[EL] signed-url failed; falling back to direct WSS');
+    const direct = new WebSocket(`wss://api.elevenlabs.io/v1/convai/twilio?agent_id=${encodeURIComponent(agentId)}`, {
+      headers: { 'xi-api-key': ELEVENLABS_API_KEY }
+    });
+    return await new Promise((resolve, reject) => {
+      direct.once('open', () => { console.log('[EL] connected (direct)'); resolve(direct); });
+      direct.once('error', (err) => reject(err));
+    });
+  }
+}
 
-    if (!agentId) {
-      console.error('[WS] no agent id available — set ELEVENLABS_AGENT_ID or DISCOVERY/DAILY vars in Railway');
-      return closeBoth(1008, 'agent-id-missing');
-    }
+wss.on('connection', async (twilioWs, req) => {
+  console.log('[WS] connected from', (req.socket && req.socket.remoteAddress) || 'client');
 
+  let streamSid = null;
+  let authed = false;
+  let agentId = ELEVENLABS_AGENT_ID;
+  let elWs = null;
+
+  // Connect to EL as soon as we know the agent/token (after 'start')
+  async function ensureEl() {
+    if (elWs) return;
     try {
-      elevenWs = await connectEleven(agentId);
+      elWs = await connectEleven(agentId);
     } catch (e) {
-      console.error('[EL] connect failed:', errMsg(e));
-      return closeBoth(1011, 'elevenlabs-connect-failed');
+      console.error('[EL] connect failed:', e?.message || e);
+      try { twilioWs.close(1011, 'elevenlabs-connect-failed'); } catch {}
     }
+    if (!elWs) return;
 
-    elevenWs.on('message', (buf) => {
-      let emsg; try { emsg = JSON.parse(String(buf)); } catch { return; }
-      if (emsg.type === 'audio' && emsg.audio_event?.audio_base_64 && streamSid) {
-        safeSend(twilioWs, JSON.stringify({ event:'media', streamSid, media:{ payload: emsg.audio_event.audio_base_64 } }));
-      } else if (emsg.type === 'interruption' && streamSid) {
-        safeSend(twilioWs, JSON.stringify({ event:'clear', streamSid }));
-      } else if (emsg.type === 'ping' && emsg.ping_event?.event_id) {
-        safeSend(elevenWs, JSON.stringify({ type:'pong', event_id: emsg.ping_event.event_id }));
+    // EL -> Twilio
+    elWs.on('message', (buf) => {
+      let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+
+      // 1) agent audio back to phone
+      const b64 = pickElAudioB64(msg);
+      if (b64 && streamSid) {
+        twilioWs.send(JSON.stringify({
+          event: 'media',
+          streamSid,
+          media: { payload: b64 }              // Twilio expects PCMU μ-law 8k base64; you set this in EL agent (TTS output μ-law 8000 Hz)
+        }));
+        if (process.env.DEBUG_AUDIO === '1') {
+          console.log(`[EL->TWILIO] ${Math.round(b64.length / 1024)}KB base64`);
+        }
+      }
+
+      // 2) interruptions / barge-in
+      if (msg.type === 'interruption' && streamSid) {
+        twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
+      }
+
+      // 3) ping/pong keepalive
+      if (msg.type === 'ping' && msg.ping_event?.event_id) {
+        elWs.send(JSON.stringify({ type: 'pong', event_id: msg.ping_event.event_id }));
       }
     });
 
-    elevenWs.on('close', (c,r)=>{ console.log('[EL] closed:', c, String(r||'')); closeBoth(c,r); });
-    elevenWs.on('error', (e)=>{ console.error('[EL] error:', errMsg(e)); });
+    elWs.on('close', (code, reason) => {
+      console.log('[EL] closed:', code, reason?.toString() || '');
+      try { twilioWs.close(code, reason); } catch {}
+    });
+
+    elWs.on('error', (e) => console.error('[EL] error:', e?.message || e));
   }
 
-  twilioWs.on('message', (buf) => {
-    let tmsg; try { tmsg = JSON.parse(String(buf)); } catch { return; }
-    switch (tmsg.event) {
-      case 'start':    return handleStart(tmsg);
-      case 'media': {
-        const p = tmsg?.media?.payload;
-        const track = tmsg?.media?.track;
-        if (authorized && p && (!track || track === 'inbound') && elevenWs && elevenWs.readyState === WebSocket.OPEN) {
-          safeSend(elevenWs, JSON.stringify({ user_audio_chunk: p }));
-        }
-        return;
+  // Twilio -> EL
+  twilioWs.on('message', async (buf) => {
+    let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+
+    if (msg.event === 'start') {
+      streamSid = msg.start?.streamSid || null;
+
+      // auth from customParameters
+      const token = msg.start?.customParameters?.token;
+      const agentFromTwiML = msg.start?.customParameters?.agent_id;  // optional override
+      if (agentFromTwiML) agentId = agentFromTwiML;
+
+      if (token && token === BRIDGE_AUTH_TOKEN) {
+        authed = true;
+        console.log('[WS] start: token accepted via customParameters');
+      } else {
+        console.warn('[WS] start: missing/invalid token');
+        try { return twilioWs.close(1008, 'bad-token'); } catch {}
       }
-      case 'stop':     console.log('[WS] stop'); return closeBoth(1000, 'stop');
-      case 'connected': return; // ignore
-      default:          return; // ignore others
+
+      console.log(`[WS] start; streamSid = ${streamSid} agent = (default) → ${agentId}`);
+      await ensureEl();
+      return;
+    }
+
+    if (msg.event === 'media') {
+      // Only forward caller mic (inbound) to EL
+      const isInbound = (msg.media?.track ? msg.media.track === 'inbound' : true);
+      if (isInbound && msg.media?.payload && elWs && authed) {
+        // Send Twilio μ-law 8k base64 chunk as user audio to EL
+        elWs.send(JSON.stringify({ user_audio_chunk: msg.media.payload }));
+      }
+      return;
+    }
+
+    if (msg.event === 'stop') {
+      console.log('[WS] stop');
+      try { elWs?.close(1000, 'stop'); } catch {}
+      try { twilioWs.close(1000, 'stop'); } catch {}
+      return;
     }
   });
 
-  twilioWs.on('close', (c,r)=>{ console.log('[WS] closed:', c, String(r||'')); closeBoth(c,r); });
-  twilioWs.on('error', (e)=>{ console.error('[WS] error:', errMsg(e)); closeBoth(1011, e.message); });
+  twilioWs.on('close', (code, reason) => {
+    console.log('[WS] closed:', code, reason?.toString() || '');
+    try { elWs?.close(code, reason); } catch {}
+  });
+
+  twilioWs.on('error', (e) => console.error('[WS] error', e?.message || e));
 });
 
-server.listen(PORT, '0.0.0.0', ()=> console.log(`[HTTP] listening on :${PORT}`));
+server.listen(PORT, () => console.log(`[HTTP] listening on :${PORT}`));
+
