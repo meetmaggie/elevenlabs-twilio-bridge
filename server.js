@@ -2,6 +2,7 @@
 // Requires Node 18+ (global fetch). Set env:
 //  BRIDGE_AUTH_TOKEN, ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID (default)
 //  (optional) DEBUG_AUDIO=1
+//  (optional) HANGUP_DELAY_MS=1500   // buffer before closing Twilio after final audio
 
 const http = require('http');
 const url = require('url');
@@ -11,6 +12,7 @@ const PORT = process.env.PORT || 8080;
 const BRIDGE_AUTH_TOKEN   = process.env.BRIDGE_AUTH_TOKEN || '';
 const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY || '';
 const DEFAULT_AGENT_ID    = process.env.ELEVENLABS_AGENT_ID || process.env.ELEVENLABS_DISCOVERY_AGENT_ID || '';
+const HANGUP_DELAY_MS     = parseInt(process.env.HANGUP_DELAY_MS || '1500', 10);
 
 if (!BRIDGE_AUTH_TOKEN || !ELEVENLABS_API_KEY || !DEFAULT_AGENT_ID) {
   console.error('[BOOT] Missing env: BRIDGE_AUTH_TOKEN / ELEVENLABS_API_KEY / ELEVENLABS_AGENT_ID');
@@ -147,7 +149,10 @@ wss.on('connection', async (twilioWs, req) => {
 
     elWs.on('close', (code, reason) => {
       console.log('[EL] closed:', code, reason?.toString() || '');
-      try { twilioWs.close(code, reason); } catch {}
+      // Graceful delay so Twilio finishes playing any final EL audio
+      setTimeout(() => {
+        try { twilioWs.close(code, reason); } catch {}
+      }, HANGUP_DELAY_MS);
     });
 
     elWs.on('error', (e) => console.error('[EL] error:', e?.message || e));
@@ -189,9 +194,12 @@ wss.on('connection', async (twilioWs, req) => {
     }
 
     if (msg.event === 'stop') {
-      console.log('[WS] stop');
-      try { elWs?.close(1000, 'stop'); } catch {}
-      try { twilioWs.close(1000, 'stop'); } catch {}
+      console.log('[WS] stop — adding graceful delay before closing');
+      // Allow final audio to finish playing before closing sockets
+      setTimeout(() => {
+        try { elWs?.close(1000, 'stop'); } catch {}
+        try { twilioWs.close(1000, 'stop'); } catch {}
+      }, HANGUP_DELAY_MS);
       return;
     }
   });
@@ -205,7 +213,3 @@ wss.on('connection', async (twilioWs, req) => {
 });
 
 server.listen(PORT, () => console.log(`[HTTP] listening on :${PORT}`));
-
-
-
-
