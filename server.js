@@ -1,10 +1,10 @@
-// server.js
+// server.js (CommonJS)
 // Railway WebSocket bridge scaffolding with robust logs & health endpoints.
 // Keep your existing Twilio <-> ElevenLabs piping logic inside the HOOK section below.
 
-import http from 'http';
-import url from 'url';
-import { WebSocketServer } from 'ws';
+const http = require('http');
+const url = require('url');
+const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
 const BRIDGE_AUTH_TOKEN = process.env.BRIDGE_AUTH_TOKEN || null;
@@ -33,7 +33,7 @@ server.on('upgrade', (req, socket, head) => {
   console.log('[UPGRADE] incoming', {
     url: req.url,
     pathname,
-    hasToken: !!query?.token,
+    hasToken: !!(query && query.token),
     ua: req.headers['user-agent'],
     xff: req.headers['x-forwarded-for'] || null,
   });
@@ -41,13 +41,15 @@ server.on('upgrade', (req, socket, head) => {
   // Only allow /ws (and /media-stream if you still use it)
   if (pathname !== '/ws' && pathname !== '/media-stream') {
     console.warn('[UPGRADE] rejecting — bad path', pathname);
-    return socket.destroy();
+    try { socket.destroy(); } catch (e) {}
+    return;
   }
 
   // Optional bearer (off by default)
-  if (BRIDGE_AUTH_TOKEN && query?.token !== BRIDGE_AUTH_TOKEN) {
+  if (BRIDGE_AUTH_TOKEN && (!query || query.token !== BRIDGE_AUTH_TOKEN)) {
     console.warn('[UPGRADE] rejected — bad/missing token');
-    return socket.destroy();
+    try { socket.destroy(); } catch (e) {}
+    return;
   }
 
   // Stash query so we can read it in 'connection'
@@ -56,7 +58,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 // CONNECTION log (Twilio should hit this right after upgrade)
-wss.on('connection', async (twilioWs, req) => {
+wss.on('connection', (twilioWs, req) => {
   console.log('[WS] CONNECTED via upgrade', req.url);
 
   // Helpful: show key query params passed from your TwiML Stream URL
@@ -74,15 +76,16 @@ wss.on('connection', async (twilioWs, req) => {
 
   // Safety: basic error/close logs
   twilioWs.on('error', (e) => {
-    console.error('[WS] Twilio socket error:', e?.message || e);
+    console.error('[WS] Twilio socket error:', (e && e.message) || e);
   });
-  twilioWs.on('close', (code, reason) => {
-    console.log('[WS] Twilio socket closed', { code, reason: reason?.toString() });
+  twilioWs.on('close', (code, reasonBuf) => {
+    const reason = reasonBuf ? reasonBuf.toString() : undefined;
+    console.log('[WS] Twilio socket closed', { code, reason });
   });
 
   // Keep Twilio connection alive (respond to ping)
   twilioWs.on('ping', (data) => {
-    try { twilioWs.pong(data); } catch {}
+    try { twilioWs.pong(data); } catch (e) {}
   });
 });
 
@@ -91,7 +94,7 @@ setInterval(() => console.log('[HEARTBEAT] alive', new Date().toISOString()), 60
 
 process.on('SIGTERM', () => {
   console.log('[LIFECYCLE] SIGTERM received — shutting down gracefully');
-  try { server.close(() => process.exit(0)); } catch { process.exit(0); }
+  try { server.close(() => process.exit(0)); } catch (e) { process.exit(0); }
 });
 
 // ---------- START ----------
@@ -112,5 +115,49 @@ function attachTwilioHandlersStub(twilioWs) {
   twilioWs.on('message', (buf) => {
     // Twilio sends JSON per line
     let msg;
-    try
+    try {
+      msg = JSON.parse(buf.toString());
+    } catch (e) {
+      console.warn('[TWILIO] non-JSON message (ignored)');
+      return;
+    }
 
+    const event = msg && msg.event;
+
+    switch (event) {
+      case 'start':
+        console.log('[TWILIO] start', {
+          streamSid: msg && msg.streamSid,
+          tracks: msg && msg.start && msg.start.tracks,
+          mediaFormat: msg && msg.start && msg.start.mediaFormat,
+        });
+        break;
+
+      case 'media':
+        mediaFrames += 1;
+        if (!sawFirstMedia) {
+          sawFirstMedia = true;
+          console.log('[TWILIO] first media frame received');
+        }
+        // NOTE: In your real bridge, you forward msg.media.payload (base64 PCM) to EL.
+        break;
+
+      case 'mark':
+        console.log('[TWILIO] mark', msg && msg.mark);
+        break;
+
+      case 'stop':
+        console.log('[TWILIO] stop', { totalMediaFrames: mediaFrames });
+        try { twilioWs.close(1000, 'normal'); } catch (e) {}
+        break;
+
+      case 'clear':
+      case ' clear': // sometimes seen with a leading space
+        console.log('[TWILIO] clear');
+        break;
+
+      default:
+        console.log('[TWILIO] event', event || '(unknown)');
+    }
+  });
+}
