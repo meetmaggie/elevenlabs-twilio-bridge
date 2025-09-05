@@ -44,12 +44,25 @@ const wss = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
-  if (pathname !== '/ws' && pathname !== '/media-stream') return socket.destroy();
-  // optional auth via query token if BRIDGE_AUTH_TOKEN is set
-  if (BRIDGE_AUTH_TOKEN && query?.token && query.token !== BRIDGE_AUTH_TOKEN) {
-    console.warn('[UPGRADE] rejected — bad query token');
+
+  // DEBUG: log upgrades
+  console.log('[UPGRADE] incoming', {
+    url: req.url,
+    pathname,
+    hasToken: !!query?.token
+  });
+
+  if (pathname !== '/ws' && pathname !== '/media-stream') {
+    console.warn('[UPGRADE] rejecting — bad path', pathname);
     return socket.destroy();
   }
+
+  // If you *have* BRIDGE_AUTH_TOKEN set and you want to enforce it, uncomment:
+  // if (BRIDGE_AUTH_TOKEN && query?.token !== BRIDGE_AUTH_TOKEN) {
+  //   console.warn('[UPGRADE] rejected — bad/missing token');
+  //   return socket.destroy();
+  // }
+
   req.__query = query || {};
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
