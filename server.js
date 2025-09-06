@@ -1,6 +1,6 @@
 // server.js (CommonJS)
 // Railway WebSocket bridge scaffolding with robust logs & health endpoints.
-// Keep your existing Twilio <-> ElevenLabs piping logic inside the HOOK section below.
+// Now reads agent/mode from Twilio <Parameter/> via the 'start' event (customParameters).
 
 const http = require('http');
 const url = require('url');
@@ -52,7 +52,7 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
-  // Stash query so we can read it in 'connection'
+  // Stash query so we can read it in 'connection' (still logged for debugging)
   req.__query = query || {};
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
@@ -61,18 +61,16 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', (twilioWs, req) => {
   console.log('[WS] CONNECTED via upgrade', req.url);
 
-  // Helpful: show key query params passed from your TwiML Stream URL
+  // For visibility only — real params now arrive via 'start'.customParameters.
   const q = req.__query || {};
-  const agentId = q.agent_id || q.agent || null;
-  const mode = q.mode || null;
-  const phone = q.phone || null;
-  const persist = q.persist || null;
+  const agentIdQ = q.agent_id || q.agent || null;
+  const modeQ = q.mode || null;
+  const phoneQ = q.phone || null;
+  const persistQ = q.persist || null;
+  console.log('[WS] query (for debug only)', { agentIdQ, modeQ, phoneQ, persistQ });
 
-  console.log('[WS] query', { agentId, mode, phone, persist });
-
-  // ---- HOOK: Twilio <-> ElevenLabs piping
-  // If you already have this in your old server.js, paste it HERE and remove the stub below.
-  attachTwilioHandlersStub(twilioWs);
+  // ---- Twilio <-> ElevenLabs piping (stub with customParameters handling)
+  attachTwilioHandlersWithParams(twilioWs);
 
   // Safety: basic error/close logs
   twilioWs.on('error', (e) => {
@@ -103,17 +101,19 @@ server.listen(PORT, () => {
 });
 
 // ============================================================================
-// === STUB HANDLERS (SAFE DEFAULTS) ==========================================
+// === TWILIO HANDLERS (reads customParameters from 'start') ===================
 // ============================================================================
-// This stub *only* logs Twilio messages so we can debug upgrade/connect issues.
-// Replace this function with your existing Twilio <-> ElevenLabs bridge code.
-
-function attachTwilioHandlersStub(twilioWs) {
+function attachTwilioHandlersWithParams(twilioWs) {
   let sawFirstMedia = false;
   let mediaFrames = 0;
 
+  // Populated when 'start' arrives
+  let agentId = null;
+  let mode = 'discovery';
+  let phone = null;
+  let persist = '0';
+
   twilioWs.on('message', (buf) => {
-    // Twilio sends JSON per line
     let msg;
     try {
       msg = JSON.parse(buf.toString());
@@ -125,13 +125,30 @@ function attachTwilioHandlersStub(twilioWs) {
     const event = msg && msg.event;
 
     switch (event) {
-      case 'start':
+      case 'connected':
+        console.log('[TWILIO] event connected');
+        return;
+
+      case 'start': {
+        const start = msg.start || {};
+        const cp = start.customParameters || {};
+        agentId = cp.agent_id || agentId;
+        mode    = (cp.mode || mode || 'discovery').toLowerCase();
+        phone   = cp.caller_phone || phone;
+        persist = cp.persist === '1' ? '1' : '0';
+
         console.log('[TWILIO] start', {
-          streamSid: msg && msg.streamSid,
-          tracks: msg && msg.start && msg.start.tracks,
-          mediaFormat: msg && msg.start && msg.start.mediaFormat,
+          streamSid: msg.streamSid,
+          tracks: start.tracks,
+          mediaFormat: start.mediaFormat,
+          customParameters: { agentId, mode, phone, persist }
         });
-        break;
+
+        // TODO: connect to ElevenLabs here using agentId/mode
+        // connectToElevenLabs({ agentId, mode, phone, twilioWs });
+
+        return;
+      }
 
       case 'media':
         mediaFrames += 1;
@@ -139,25 +156,26 @@ function attachTwilioHandlersStub(twilioWs) {
           sawFirstMedia = true;
           console.log('[TWILIO] first media frame received');
         }
-        // NOTE: In your real bridge, you forward msg.media.payload (base64 PCM) to EL.
-        break;
+        // In your real bridge, forward msg.media.payload (base64 mulaw/8k) to ElevenLabs WS.
+        return;
 
       case 'mark':
-        console.log('[TWILIO] mark', msg && msg.mark);
-        break;
+        console.log('[TWILIO] mark', msg.mark);
+        return;
 
       case 'stop':
         console.log('[TWILIO] stop', { totalMediaFrames: mediaFrames });
         try { twilioWs.close(1000, 'normal'); } catch (e) {}
-        break;
+        return;
 
       case 'clear':
-      case ' clear': // sometimes seen with a leading space
+      case ' clear':
         console.log('[TWILIO] clear');
-        break;
+        return;
 
       default:
         console.log('[TWILIO] event', event || '(unknown)');
+        return;
     }
   });
 }
