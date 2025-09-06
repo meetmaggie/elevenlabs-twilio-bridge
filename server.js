@@ -1,10 +1,7 @@
-// server.js (CommonJS) — Twilio <-> ElevenLabs ConvAI bridge
-// - Reads <Parameter/> from Twilio 'start' (agent_id, mode, caller_phone, persist)
-// - Connects to EL (tries /v1/convai/ws then falls back to /v1/convai/conversation)
-// - Sends initial greeting; nudges with user_message if needed
-// - If EL reports ulaw_8000, pass-through audio (no transcoding)
-// - ELSE convert μ-law<->PCM16 and up/downsample
-// - CRUCIAL: include Twilio streamSid when sending media back to Twilio
+// server.js — Twilio <-> ElevenLabs ConvAI bridge with proper 20ms outbound chunking
+// Env (Railway):
+//   ELEVENLABS_API_KEY, ELEVENLABS_DISCOVERY_AGENT_ID (opt), ELEVENLABS_DAILY_AGENT_ID (opt)
+//   NODE_ENV=production, (opt) EL_WELCOME, (opt) BRIDGE_AUTH_TOKEN
 
 const http = require('http');
 const url = require('url');
@@ -16,7 +13,7 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || null;
 const DISCOVERY_ID = process.env.ELEVENLABS_DISCOVERY_AGENT_ID || null;
 const DAILY_ID = process.env.ELEVENLABS_DAILY_AGENT_ID || null;
 
-// ---------- HTTP (health + root) ----------
+// ---------- HTTP ----------
 const server = http.createServer((req, res) => {
   if (req.url === '/health') return res.writeHead(200, {'Content-Type':'text/plain'}).end('ok');
   if (req.url === '/' || req.url === '/status') return res.writeHead(200, {'Content-Type':'text/plain'}).end('voice-bridge: up');
@@ -40,7 +37,6 @@ server.on('upgrade', (req, socket, head) => {
     try { socket.destroy(); } catch {}
     return;
   }
-
   req.__query = query || {};
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
@@ -48,10 +44,7 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', (twilioWs, req) => {
   console.log('[WS] CONNECTED via upgrade', req.url);
   const q = req.__query || {};
-  console.log('[WS] query (debug)', {
-    agentIdQ: q.agent_id || q.agent || null, modeQ: q.mode || null,
-    phoneQ: q.phone || null, persistQ: q.persist || null
-  });
+  console.log('[WS] query (debug)', { agentIdQ: q.agent_id || q.agent || null, modeQ: q.mode || null, phoneQ: q.phone || null, persistQ: q.persist || null });
 
   attachBridgeHandlers(twilioWs);
 
@@ -75,7 +68,7 @@ function attachBridgeHandlers(twilioWs) {
 
   // Populated at 'start'
   let agentId = null, mode = 'discovery', phone = null, persist = '0';
-  let twilioStreamSid = null; // <-- we will pass this back on outbound media
+  let twilioStreamSid = null;
 
   // ElevenLabs state
   let elWs = null;
@@ -83,20 +76,22 @@ function attachBridgeHandlers(twilioWs) {
   let elInFormat = null;   // 'ulaw_8000' | 'pcm_16000' | etc.
   let elOutFormat = null;
 
-  const pendingCallerChunks = []; // μ-law base64 buffered until EL metadata arrives
+  // Outbound sequencing to Twilio
+  let outboundSeq = 0;
+  let outboundChunk = 0;
+  let outboundTimestampMs = 0; // increase by 20 per frame
+
+  const pendingCallerChunks = []; // μ-law base64 buffered until metadata
 
   twilioWs.on('message', (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
     const event = msg?.event;
 
-    if (event === 'connected') {
-      console.log('[TWILIO] event connected');
-      return;
-    }
+    if (event === 'connected') { console.log('[TWILIO] event connected'); return; }
 
     if (event === 'start') {
       const start = msg.start || {};
-      twilioStreamSid = msg.streamSid || start.streamSid || null; // <-- capture streamSid
+      twilioStreamSid = msg.streamSid || start.streamSid || null;
 
       const cp = start.customParameters || {};
       agentId = cp.agent_id || (((cp.mode || 'discovery').toLowerCase() === 'daily') ? DAILY_ID : DISCOVERY_ID);
@@ -122,6 +117,11 @@ function attachBridgeHandlers(twilioWs) {
           console.log('[EL] formats', { elInFormat, elOutFormat });
           elReady = true;
 
+          // Reset outbound sequencing per new conversation
+          outboundSeq = 0;
+          outboundChunk = 0;
+          outboundTimestampMs = 0;
+
           if (pendingCallerChunks.length) {
             console.log(`[EL] flushing ${pendingCallerChunks.length} buffered chunks`);
             for (const b64 of pendingCallerChunks) {
@@ -143,35 +143,27 @@ function attachBridgeHandlers(twilioWs) {
         onAudioFromEL: (audioB64) => {
           try {
             if (elOutFormat === 'ulaw_8000') {
-              // Pass-through to Twilio with streamSid + track
-              twilioWs.send(JSON.stringify({
-                event: 'media',
-                streamSid: twilioStreamSid || undefined,
-                media: { payload: audioB64, track: 'outbound' }
-              }));
-              // Optional: request a mark acknowledgement
-              twilioWs.send(JSON.stringify({
-                event: 'mark',
-                streamSid: twilioStreamSid || undefined,
-                mark: { name: `el-chunk-${Date.now()}` }
-              }));
+              // CHUNK μ-law bytes into 20ms frames (160 bytes per frame @8kHz)
+              const u = Buffer.from(audioB64, 'base64');
+              const FRAME = 160;
+              for (let off = 0; off < u.length; off += FRAME) {
+                const slice = u.subarray(off, Math.min(off + FRAME, u.length));
+                const payloadB64 = slice.toString('base64');
+                sendOutboundMediaFrame(twilioWs, twilioStreamSid, payloadB64, ++outboundSeq, ++outboundChunk, outboundTimestampMs);
+                outboundTimestampMs += 20;
+              }
             } else {
-              // Convert PCM16@16k -> μ-law@8k
+              // Convert PCM16@16k from EL -> μ-law@8k, then chunk to 20ms frames
               const pcm16_16k = Buffer.from(audioB64, 'base64');
               const pcm16_8k  = downsamplePcm16Mono16kTo8k(pcm16_16k);
               const muLawBuf  = pcm16ToMuLaw(pcm16_8k);
-              const muLawB64  = muLawBuf.toString('base64');
-
-              twilioWs.send(JSON.stringify({
-                event: 'media',
-                streamSid: twilioStreamSid || undefined,
-                media: { payload: muLawB64, track: 'outbound' }
-              }));
-              twilioWs.send(JSON.stringify({
-                event: 'mark',
-                streamSid: twilioStreamSid || undefined,
-                mark: { name: `el-chunk-${Date.now()}` }
-              }));
+              const FRAME = 160;
+              for (let off = 0; off < muLawBuf.length; off += FRAME) {
+                const slice = muLawBuf.subarray(off, Math.min(off + FRAME, muLawBuf.length));
+                const payloadB64 = slice.toString('base64');
+                sendOutboundMediaFrame(twilioWs, twilioStreamSid, payloadB64, ++outboundSeq, ++outboundChunk, outboundTimestampMs);
+                outboundTimestampMs += 20;
+              }
             }
           } catch (e) {
             console.error('[PIPE OUT] error sending EL audio to Twilio', e?.message || e);
@@ -198,9 +190,7 @@ function attachBridgeHandlers(twilioWs) {
             const muLawBuf  = Buffer.from(muLawB64, 'base64');
             const pcm16_8k  = muLawToPcm16(muLawBuf);
             const pcm16_16k = upsamplePcm16Mono8kTo16k(pcm16_8k);
-            const b64_16k   = Buffer
-              .from(pcm16_16k.buffer, pcm16_16k.byteOffset, pcm16_16k.byteLength)
-              .toString('base64');
+            const b64_16k   = Buffer.from(pcm16_16k.buffer, pcm16_16k.byteOffset, pcm16_16k.byteLength).toString('base64');
             elWs.send(JSON.stringify({ user_audio_chunk: b64_16k }));
           }
         } else {
@@ -219,6 +209,28 @@ function attachBridgeHandlers(twilioWs) {
 
     console.log('[TWILIO] event', event || '(unknown)');
   });
+}
+
+// Send one outbound media frame to Twilio (20ms, μ-law base64)
+function sendOutboundMediaFrame(twilioWs, streamSid, payloadB64, seq, chunk, tsMs) {
+  const msg = {
+    event: 'media',
+    streamSid: streamSid || undefined,
+    sequenceNumber: String(seq),
+    media: {
+      track: 'outbound',
+      chunk: String(chunk),
+      timestamp: String(tsMs),
+      payload: payloadB64
+    }
+  };
+  twilioWs.send(JSON.stringify(msg));
+  // Optional: request an acknowledgement mark
+  twilioWs.send(JSON.stringify({
+    event: 'mark',
+    streamSid: streamSid || undefined,
+    mark: { name: `el-chunk-${chunk}` }
+  }));
 }
 
 // ===================== ElevenLabs ConvAI (robust connect) =====================
@@ -240,10 +252,10 @@ function connectToElevenLabs({ agentId, mode, phone, onMetadata, onAudioFromEL, 
   const headers = { 'xi-api-key': ELEVENLABS_API_KEY };
 
   function tryConnect() {
-    const url = endpoints[which];
-    console.log('[EL] connecting', { endpoint: url.replace(/^wss:\/\/api\.elevenlabs\.io/, '...') });
+    const endpoint = endpoints[which];
+    console.log('[EL] connecting', { endpoint: endpoint.replace(/^wss:\/\/api\.elevenlabs\.io/, '...') });
 
-    elWs = new WebSocket(url, { headers });
+    elWs = new WebSocket(endpoint, { headers });
 
     connectTimer = setTimeout(() => {
       if (!connected) {
@@ -265,12 +277,8 @@ function connectToElevenLabs({ agentId, mode, phone, onMetadata, onAudioFromEL, 
         },
         dynamic_variables: { caller_phone: phone || "" }
       };
-      try {
-        elWs.send(JSON.stringify(init));
-        console.log('[EL] sent conversation_initiation_client_data');
-      } catch (e) {
-        console.error('[EL] failed to send initiation data', e?.message || e);
-      }
+      try { elWs.send(JSON.stringify(init)); console.log('[EL] sent conversation_initiation_client_data'); }
+      catch (e) { console.error('[EL] failed to send initiation data', e?.message || e); }
 
       // If no metadata within 2s, nudge & log
       metaTimer = setTimeout(() => {
@@ -300,30 +308,15 @@ function connectToElevenLabs({ agentId, mode, phone, onMetadata, onAudioFromEL, 
         return;
       }
 
-      if (obj && obj.type === 'user_transcript') {
-        console.log('[EL] user_transcript:', obj.user_transcription_event?.user_transcript);
-        return;
-      }
-      if (obj && obj.type === 'agent_response') {
-        console.log('[EL] agent_response:', obj.agent_response_event?.agent_response);
-        return;
-      }
-      if (obj && obj.type === 'ping') {
-        try { elWs.send(JSON.stringify({ type: 'pong', event_id: obj.ping_event?.event_id })); } catch {}
-        return;
-      }
+      if (obj && obj.type === 'user_transcript') { console.log('[EL] user_transcript:', obj.user_transcription_event?.user_transcript); return; }
+      if (obj && obj.type === 'agent_response') { console.log('[EL] agent_response:', obj.agent_response_event?.agent_response); return; }
+      if (obj && obj.type === 'ping') { try { elWs.send(JSON.stringify({ type: 'pong', event_id: obj.ping_event?.event_id })); } catch {} return; }
     });
 
     elWs.on('close', (code, reason) => {
-      clearTimeout(connectTimer);
-      clearTimeout(metaTimer);
+      clearTimeout(connectTimer); clearTimeout(metaTimer);
       console.log('[EL] closed', { code, reason: reason?.toString() });
-      // Fallback to second endpoint if the first failed early
-      if (!connected && which === 0) {
-        which = 1;
-        setTimeout(tryConnect, 250);
-        return;
-      }
+      if (!connected && which === 0) { which = 1; setTimeout(tryConnect, 250); return; }
       try { onClose && onClose(); } catch {}
     });
 
