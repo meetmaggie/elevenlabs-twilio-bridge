@@ -1,13 +1,8 @@
-// server.js (CommonJS) — Twilio <-> ElevenLabs ConvAI bridge with ulaw_8000 pass-through
-// If EL reports ulaw_8000 in metadata, we forward audio without transcoding.
-// Otherwise we convert μ-law<->PCM16 and up/downsample as needed.
-//
-// Env (Railway -> Variables):
-//   ELEVENLABS_API_KEY
-//   ELEVENLABS_DISCOVERY_AGENT_ID  (optional fallback)
-//   ELEVENLABS_DAILY_AGENT_ID      (optional fallback)
-//   NODE_ENV=production (recommended)
-//   BRIDGE_AUTH_TOKEN (optional)
+// server.js (CommonJS) — Twilio <-> ElevenLabs ConvAI bridge
+// - Uses <Parameter/> customParameters from Twilio 'start' event (agent_id, mode, caller_phone, persist)
+// - Sends an initial greeting to EL so the caller immediately hears audio
+// - If EL reports ulaw_8000, we pass audio through without transcoding
+// - Otherwise we convert μ-law<->PCM16 and up/downsample as needed
 
 const http = require('http');
 const url = require('url');
@@ -19,7 +14,7 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || null;
 const DISCOVERY_ID = process.env.ELEVENLABS_DISCOVERY_AGENT_ID || null;
 const DAILY_ID = process.env.ELEVENLABS_DAILY_AGENT_ID || null;
 
-// ---------- HTTP ----------
+// ---------- HTTP (health + root) ----------
 const server = http.createServer((req, res) => {
   if (req.url === '/health') return res.writeHead(200, {'Content-Type':'text/plain'}).end('ok');
   if (req.url === '/' || req.url === '/status') return res.writeHead(200, {'Content-Type':'text/plain'}).end('voice-bridge: up');
@@ -79,17 +74,16 @@ function attachBridgeHandlers(twilioWs) {
   let sawFirstMedia = false;
   let mediaFrames = 0;
 
-  // Populated at start
+  // Filled at 'start'
   let agentId = null, mode = 'discovery', phone = null, persist = '0';
 
-  // ElevenLabs WS + formats from metadata
+  // ElevenLabs state
   let elWs = null;
   let elReady = false;
-  let elInFormat = null;   // what EL expects from us (e.g., 'ulaw_8000' or 'pcm_16000')
-  let elOutFormat = null;  // what EL will send back
+  let elInFormat = null;   // e.g., 'ulaw_8000' or 'pcm_16000'
+  let elOutFormat = null;  // e.g., 'ulaw_8000' or 'pcm_16000'
 
-  // Buffer caller chunks until EL says it's ready
-  const pendingCallerChunks = [];
+  const pendingCallerChunks = []; // buffer until EL metadata arrives
 
   twilioWs.on('message', (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
@@ -115,44 +109,50 @@ function attachBridgeHandlers(twilioWs) {
         customParameters: { agentId, mode, phone, persist }
       });
 
-      if (!ELEVENLABS_API_KEY) {
-        console.error('❌ Missing ELEVENLABS_API_KEY');
-        return;
-      }
-      if (!agentId) {
-        console.error('❌ Missing agentId (no <Parameter/> and no env fallback)');
-        return;
-      }
+      if (!ELEVENLABS_API_KEY) { console.error('❌ Missing ELEVENLABS_API_KEY'); return; }
+      if (!agentId) { console.error('❌ Missing agentId (no <Parameter/> and no env fallback)'); return; }
 
       elWs = connectToElevenLabs({
         agentId, mode, phone,
         onMetadata: ({ user_input_audio_format, agent_output_audio_format }) => {
-          elInFormat = user_input_audio_format;
+          elInFormat  = user_input_audio_format;
           elOutFormat = agent_output_audio_format;
           console.log('[EL] formats', { elInFormat, elOutFormat });
           elReady = true;
-          // flush any buffered caller chunks (already in the correct format)
+          // Flush any buffered caller chunks (they’re μ-law base64)
           if (pendingCallerChunks.length) {
             console.log(`[EL] flushing ${pendingCallerChunks.length} buffered chunks`);
-            for (const chunk of pendingCallerChunks) {
-              // chunk is already ulaw or pcm16 depending on our branch below
-              try { elWs.send(JSON.stringify({ user_audio_chunk: chunk })); } catch {}
+            for (const b64 of pendingCallerChunks) {
+              try {
+                if (elInFormat === 'ulaw_8000') {
+                  elWs.send(JSON.stringify({ user_audio_chunk: b64 }));
+                } else {
+                  // Convert μ-law@8k -> PCM16@16k before sending
+                  const muLawBuf  = Buffer.from(b64, 'base64');
+                  const pcm16_8k  = muLawToPcm16(muLawBuf);
+                  const pcm16_16k = upsamplePcm16Mono8kTo16k(pcm16_8k);
+                  const pcm16_16k_B64 = Buffer
+                    .from(pcm16_16k.buffer, pcm16_16k.byteOffset, pcm16_16k.byteLength)
+                    .toString('base64');
+                  elWs.send(JSON.stringify({ user_audio_chunk: pcm16_16k_B64 }));
+                }
+              } catch {}
             }
             pendingCallerChunks.length = 0;
           }
         },
-        onAudioFromEL: (audioB64 /* EL output format per elOutFormat */) => {
+        onAudioFromEL: (audioB64) => {
           try {
             if (elOutFormat === 'ulaw_8000') {
               // Direct pass-through to Twilio
-              twilioWs.send(JSON.stringify({ event: 'media', media: { payload: audioB64 }}));
+              twilioWs.send(JSON.stringify({ event: 'media', media: { payload: audioB64 } }));
             } else {
-              // Assume PCM16 @ 16k; convert to μ-law@8k for Twilio
+              // Convert PCM16@16k -> μ-law@8k for Twilio
               const pcm16_16k = Buffer.from(audioB64, 'base64');
               const pcm16_8k  = downsamplePcm16Mono16kTo8k(pcm16_16k);
               const muLawBuf  = pcm16ToMuLaw(pcm16_8k);
               const muLawB64  = muLawBuf.toString('base64');
-              twilioWs.send(JSON.stringify({ event: 'media', media: { payload: muLawB64 }}));
+              twilioWs.send(JSON.stringify({ event: 'media', media: { payload: muLawB64 } }));
             }
           } catch (e) {
             console.error('[PIPE OUT] error sending EL audio to Twilio', e?.message || e);
@@ -171,14 +171,13 @@ function attachBridgeHandlers(twilioWs) {
       const muLawB64 = msg?.media?.payload;
       if (!muLawB64) return;
 
-      // Decide how to send to EL based on metadata
       if (elWs && elWs.readyState === WebSocket.OPEN) {
         if (elReady) {
           if (elInFormat === 'ulaw_8000') {
-            // Direct pass-through (best)
+            // Pass through to EL
             elWs.send(JSON.stringify({ user_audio_chunk: muLawB64 }));
           } else {
-            // Convert μ-law@8k -> PCM16@16k for EL
+            // Convert μ-law@8k -> PCM16@16k
             const muLawBuf  = Buffer.from(muLawB64, 'base64');
             const pcm16_8k  = muLawToPcm16(muLawBuf);
             const pcm16_16k = upsamplePcm16Mono8kTo16k(pcm16_8k);
@@ -221,33 +220,60 @@ function connectToElevenLabs({ agentId, mode, phone, onMetadata, onAudioFromEL, 
 
   const elWs = new WebSocket(elUrl, { headers });
 
+  // --- On open: send a greeting so the caller hears audio immediately
   elWs.on('open', () => {
     console.log('[EL] connected');
-    // Optional: seed conversation
-    // elWs.send(JSON.stringify({ type: 'conversation_initiation_client_data', conversation_config_override: { agent: { language: 'en' }}}));
+    const welcome = process.env.EL_WELCOME || "Hi there! I'm your assistant. How can I help today?";
+    const init = {
+      type: "conversation_initiation_client_data",
+      conversation_config_override: {
+        agent: {
+          first_message: welcome,
+          language: "en"
+        }
+      },
+      dynamic_variables: { caller_phone: phone || "" }
+    };
+    try {
+      elWs.send(JSON.stringify(init));
+      console.log('[EL] sent conversation_initiation_client_data');
+    } catch (e) {
+      console.error('[EL] failed to send initiation data', e?.message || e);
+    }
   });
 
   elWs.on('message', (data) => {
     let obj; try { obj = JSON.parse(data.toString()); } catch { obj = null; }
 
-    // Formats arrive in the metadata event
+    // Metadata includes audio formats — mark ready and flush buffers
     if (obj && obj.type === 'conversation_initiation_metadata') {
       const meta = obj.conversation_initiation_metadata_event || {};
       console.log('[EL] metadata', meta);
-      try { onMetadata && onMetadata({
-        user_input_audio_format: meta.user_input_audio_format,
-        agent_output_audio_format: meta.agent_output_audio_format
-      }); } catch {}
+      try {
+        onMetadata && onMetadata({
+          user_input_audio_format: meta.user_input_audio_format,
+          agent_output_audio_format: meta.agent_output_audio_format
+        });
+      } catch {}
+
+      // Fallback nudge in case the agent still waits
+      setTimeout(() => {
+        try {
+          elWs.send(JSON.stringify({ type: "user_message", text: "Hello" }));
+          console.log('[EL] nudged with user_message: "Hello"');
+        } catch {}
+      }, 1000);
+
       return;
     }
 
-    // Agent audio
+    // Agent audio event
     if (obj && obj.type === 'audio' && obj.audio_event && obj.audio_event.audio_base_64) {
       try { onAudioFromEL && onAudioFromEL(obj.audio_event.audio_base_64); } catch {}
       return;
     }
 
-    // Nice-to-have logs
+    // Useful logs
     if (obj && obj.type === 'user_transcript') {
       console.log('[EL] user_transcript:', obj.user_transcription_event?.user_transcript);
       return;
@@ -257,7 +283,7 @@ function connectToElevenLabs({ agentId, mode, phone, onMetadata, onAudioFromEL, 
       return;
     }
     if (obj && obj.type === 'ping') {
-      // Optionally reply
+      // optional pong
       try { elWs.send(JSON.stringify({ type: 'pong', event_id: obj.ping_event?.event_id })); } catch {}
       return;
     }
@@ -304,16 +330,14 @@ function pcm16ToMuLaw(pcm) {
   return out;
 }
 
-// 8k -> 16k naive upsample (duplicate samples)
+// 8k -> 16k (duplicate samples – simple & fast)
 function upsamplePcm16Mono8kTo16k(pcm8k) {
   const out = new Int16Array(pcm8k.length * 2);
-  for (let i = 0, j = 0; i < pcm8k.length; i++, j += 2) {
-    const s = pcm8k[i]; out[j] = s; out[j + 1] = s;
-  }
+  for (let i = 0, j = 0; i < pcm8k.length; i++, j += 2) { const s = pcm8k[i]; out[j] = s; out[j + 1] = s; }
   return out;
 }
 
-// 16k -> 8k naive downsample (drop every other sample)
+// 16k -> 8k (drop every other sample – simple & fast)
 function downsamplePcm16Mono16kTo8k(pcm16kBuf) {
   const in16 = new Int16Array(pcm16kBuf.buffer, pcm16kBuf.byteOffset, Math.floor(pcm16kBuf.byteLength / 2));
   const out = new Int16Array(Math.floor(in16.length / 2));
