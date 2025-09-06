@@ -1,7 +1,12 @@
-// server.js — Twilio <-> ElevenLabs ConvAI bridge with proper 20ms outbound chunking
-// Env (Railway):
-//   ELEVENLABS_API_KEY, ELEVENLABS_DISCOVERY_AGENT_ID (opt), ELEVENLABS_DAILY_AGENT_ID (opt)
-//   NODE_ENV=production, (opt) EL_WELCOME, (opt) BRIDGE_AUTH_TOKEN
+// server.js (CommonJS) — Twilio <-> ElevenLabs ConvAI bridge
+// Features:
+// - /ws WebSocket for Twilio Media Streams
+// - Reads <Parameter/> on Twilio 'start' (agent_id, mode, caller_phone, persist)
+// - Connects to ElevenLabs (tries /v1/convai/ws then /v1/convai/conversation)
+// - Sends greeting and nudges agent; forces TTS voice via EL_VOICE_ID (or Rachel default)
+// - If EL reports ulaw_8000, pass-through audio; else convert PCM16<->μ-law
+// - Outbound audio to Twilio in 20ms frames (160B μ-law), with streamSid + sequencing
+// - LOOPBACK_ONLY=1 echoes caller audio back (diagnostic)
 
 const http = require('http');
 const url = require('url');
@@ -9,9 +14,13 @@ const { WebSocketServer, WebSocket } = require('ws');
 
 const PORT = process.env.PORT || 8080;
 const BRIDGE_AUTH_TOKEN = process.env.BRIDGE_AUTH_TOKEN || null;
+
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || null;
 const DISCOVERY_ID = process.env.ELEVENLABS_DISCOVERY_AGENT_ID || null;
 const DAILY_ID = process.env.ELEVENLABS_DAILY_AGENT_ID || null;
+const EL_VOICE_ID = process.env.EL_VOICE_ID || '21m00Tcm4TlvDq8ikWAM'; // Rachel default
+const EL_WELCOME = process.env.EL_WELCOME || "Hi there! I'm your assistant. How can I help today?";
+const LOOPBACK_ONLY = (process.env.LOOPBACK_ONLY || '').trim() === '1';
 
 // ---------- HTTP ----------
 const server = http.createServer((req, res) => {
@@ -25,7 +34,12 @@ const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
-  console.log('[UPGRADE] incoming', { url: req.url, pathname, hasToken: !!(query && query.token), ua: req.headers['user-agent'], xff: req.headers['x-forwarded-for'] || null });
+  console.log('[UPGRADE] incoming', {
+    url: req.url, pathname,
+    hasToken: !!(query && query.token),
+    ua: req.headers['user-agent'],
+    xff: req.headers['x-forwarded-for'] || null
+  });
 
   if (pathname !== '/ws' && pathname !== '/media-stream') {
     console.warn('[UPGRADE] rejecting — bad path', pathname);
@@ -37,6 +51,7 @@ server.on('upgrade', (req, socket, head) => {
     try { socket.destroy(); } catch {}
     return;
   }
+
   req.__query = query || {};
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
@@ -44,7 +59,12 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', (twilioWs, req) => {
   console.log('[WS] CONNECTED via upgrade', req.url);
   const q = req.__query || {};
-  console.log('[WS] query (debug)', { agentIdQ: q.agent_id || q.agent || null, modeQ: q.mode || null, phoneQ: q.phone || null, persistQ: q.persist || null });
+  console.log('[WS] query (debug)', {
+    agentIdQ: q.agent_id || q.agent || null,
+    modeQ: q.mode || null,
+    phoneQ: q.phone || null,
+    persistQ: q.persist || null
+  });
 
   attachBridgeHandlers(twilioWs);
 
@@ -56,38 +76,46 @@ wss.on('connection', (twilioWs, req) => {
   twilioWs.on('ping', data => { try { twilioWs.pong(data); } catch {} });
 });
 
+// ---------- Lifecycle ----------
 setInterval(() => console.log('[HEARTBEAT] alive', new Date().toISOString()), 60_000);
-process.on('SIGTERM', () => { console.log('[LIFECYCLE] SIGTERM received — shutting down gracefully'); try { server.close(() => process.exit(0)); } catch { process.exit(0); }});
+process.on('SIGTERM', () => {
+  console.log('[LIFECYCLE] SIGTERM received — shutting down gracefully');
+  try { server.close(() => process.exit(0)); } catch { process.exit(0); }
+});
 server.listen(PORT, () => console.log(`[HTTP] listening on :${PORT}`));
 
-// ===================== BRIDGE CORE =====================
+// ============================================================================
+// BRIDGE CORE
+// ============================================================================
 
 function attachBridgeHandlers(twilioWs) {
   let sawFirstMedia = false;
   let mediaFrames = 0;
 
-  // Populated at 'start'
+  // From Twilio 'start'
   let agentId = null, mode = 'discovery', phone = null, persist = '0';
   let twilioStreamSid = null;
 
   // ElevenLabs state
-  let elWs = null;
-  let elReady = false;
-  let elInFormat = null;   // 'ulaw_8000' | 'pcm_16000' | etc.
-  let elOutFormat = null;
+  let elWs = null, elReady = false;
+  let elInFormat = null, elOutFormat = null;
 
   // Outbound sequencing to Twilio
   let outboundSeq = 0;
   let outboundChunk = 0;
-  let outboundTimestampMs = 0; // increase by 20 per frame
+  let outboundTimestampMs = 0; // +20 per frame
 
-  const pendingCallerChunks = []; // μ-law base64 buffered until metadata
+  // Buffer caller audio until EL metadata arrives
+  const pendingCallerChunks = []; // μ-law base64
 
   twilioWs.on('message', (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
     const event = msg?.event;
 
-    if (event === 'connected') { console.log('[TWILIO] event connected'); return; }
+    if (event === 'connected') {
+      console.log('[TWILIO] event connected');
+      return;
+    }
 
     if (event === 'start') {
       const start = msg.start || {};
@@ -103,74 +131,82 @@ function attachBridgeHandlers(twilioWs) {
         streamSid: twilioStreamSid,
         tracks: start.tracks,
         mediaFormat: start.mediaFormat, // audio/x-mulaw, 8000, 1
-        customParameters: { agentId, mode, phone, persist }
+        customParameters: { agentId, mode, phone, persist },
+        LOOPBACK_ONLY
       });
 
-      if (!ELEVENLABS_API_KEY) { console.error('❌ Missing ELEVENLABS_API_KEY'); return; }
-      if (!agentId) { console.error('❌ Missing agentId (no <Parameter/> and no env fallback)'); return; }
+      if (!LOOPBACK_ONLY) {
+        if (!ELEVENLABS_API_KEY) { console.error('❌ Missing ELEVENLABS_API_KEY'); return; }
+        if (!agentId)            { console.error('❌ Missing agentId (no <Parameter/> and no env fallback)'); return; }
+        elWs = connectToElevenLabs({
+          agentId, mode, phone,
+          onMetadata: ({ user_input_audio_format, agent_output_audio_format }) => {
+            elInFormat  = user_input_audio_format;
+            elOutFormat = agent_output_audio_format;
+            console.log('[EL] formats', { elInFormat, elOutFormat });
+            elReady = true;
 
-      elWs = connectToElevenLabs({
-        agentId, mode, phone,
-        onMetadata: ({ user_input_audio_format, agent_output_audio_format }) => {
-          elInFormat  = user_input_audio_format;
-          elOutFormat = agent_output_audio_format;
-          console.log('[EL] formats', { elInFormat, elOutFormat });
-          elReady = true;
+            // Reset outbound sequencing each conversation
+            outboundSeq = 0;
+            outboundChunk = 0;
+            outboundTimestampMs = 0;
 
-          // Reset outbound sequencing per new conversation
-          outboundSeq = 0;
-          outboundChunk = 0;
-          outboundTimestampMs = 0;
+            // Flush any buffered caller chunks
+            if (pendingCallerChunks.length) {
+              console.log(`[EL] flushing ${pendingCallerChunks.length} buffered chunks`);
+              for (const b64 of pendingCallerChunks) {
+                try {
+                  if (elInFormat === 'ulaw_8000') {
+                    elWs.send(JSON.stringify({ user_audio_chunk: b64 }));
+                  } else {
+                    const muLawBuf  = Buffer.from(b64, 'base64');
+                    const pcm16_8k  = muLawToPcm16(muLawBuf);
+                    const pcm16_16k = upsamplePcm16Mono8kTo16k(pcm16_8k);
+                    const b64_16k   = Buffer.from(pcm16_16k.buffer, pcm16_16k.byteOffset, pcm16_16k.byteLength).toString('base64');
+                    elWs.send(JSON.stringify({ user_audio_chunk: b64_16k }));
+                  }
+                } catch {}
+              }
+              pendingCallerChunks.length = 0;
+            }
+          },
+          onAudioFromEL: (audioB64) => {
+            try {
+              console.log('[EL->TWILIO] audio chunk', {
+                len: Buffer.from(audioB64, 'base64').length,
+                format: elOutFormat
+              });
 
-          if (pendingCallerChunks.length) {
-            console.log(`[EL] flushing ${pendingCallerChunks.length} buffered chunks`);
-            for (const b64 of pendingCallerChunks) {
-              try {
-                if (elInFormat === 'ulaw_8000') {
-                  elWs.send(JSON.stringify({ user_audio_chunk: b64 }));
-                } else {
-                  const muLawBuf  = Buffer.from(b64, 'base64');
-                  const pcm16_8k  = muLawToPcm16(muLawBuf);
-                  const pcm16_16k = upsamplePcm16Mono8kTo16k(pcm16_8k);
-                  const b64_16k   = Buffer.from(pcm16_16k.buffer, pcm16_16k.byteOffset, pcm16_16k.byteLength).toString('base64');
-                  elWs.send(JSON.stringify({ user_audio_chunk: b64_16k }));
+              if (elOutFormat === 'ulaw_8000') {
+                // Chunk μ-law into 20ms frames
+                const u = Buffer.from(audioB64, 'base64');
+                const FRAME = 160;
+                for (let off = 0; off < u.length; off += FRAME) {
+                  const slice = u.subarray(off, Math.min(off + FRAME, u.length));
+                  const payloadB64 = slice.toString('base64');
+                  sendOutboundMediaFrame(twilioWs, twilioStreamSid, payloadB64, ++outboundSeq, ++outboundChunk, outboundTimestampMs);
+                  outboundTimestampMs += 20;
                 }
-              } catch {}
-            }
-            pendingCallerChunks.length = 0;
-          }
-        },
-        onAudioFromEL: (audioB64) => {
-          try {
-            if (elOutFormat === 'ulaw_8000') {
-              // CHUNK μ-law bytes into 20ms frames (160 bytes per frame @8kHz)
-              const u = Buffer.from(audioB64, 'base64');
-              const FRAME = 160;
-              for (let off = 0; off < u.length; off += FRAME) {
-                const slice = u.subarray(off, Math.min(off + FRAME, u.length));
-                const payloadB64 = slice.toString('base64');
-                sendOutboundMediaFrame(twilioWs, twilioStreamSid, payloadB64, ++outboundSeq, ++outboundChunk, outboundTimestampMs);
-                outboundTimestampMs += 20;
+              } else {
+                // Convert PCM16@16k -> μ-law@8k, then chunk
+                const pcm16_16k = Buffer.from(audioB64, 'base64');
+                const pcm16_8k  = downsamplePcm16Mono16kTo8k(pcm16_16k);
+                const muLawBuf  = pcm16ToMuLaw(pcm16_8k);
+                const FRAME = 160;
+                for (let off = 0; off < muLawBuf.length; off += FRAME) {
+                  const slice = muLawBuf.subarray(off, Math.min(off + FRAME, muLawBuf.length));
+                  const payloadB64 = slice.toString('base64');
+                  sendOutboundMediaFrame(twilioWs, twilioStreamSid, payloadB64, ++outboundSeq, ++outboundChunk, outboundTimestampMs);
+                  outboundTimestampMs += 20;
+                }
               }
-            } else {
-              // Convert PCM16@16k from EL -> μ-law@8k, then chunk to 20ms frames
-              const pcm16_16k = Buffer.from(audioB64, 'base64');
-              const pcm16_8k  = downsamplePcm16Mono16kTo8k(pcm16_16k);
-              const muLawBuf  = pcm16ToMuLaw(pcm16_8k);
-              const FRAME = 160;
-              for (let off = 0; off < muLawBuf.length; off += FRAME) {
-                const slice = muLawBuf.subarray(off, Math.min(off + FRAME, muLawBuf.length));
-                const payloadB64 = slice.toString('base64');
-                sendOutboundMediaFrame(twilioWs, twilioStreamSid, payloadB64, ++outboundSeq, ++outboundChunk, outboundTimestampMs);
-                outboundTimestampMs += 20;
-              }
+            } catch (e) {
+              console.error('[PIPE OUT] error sending EL audio to Twilio', e?.message || e);
             }
-          } catch (e) {
-            console.error('[PIPE OUT] error sending EL audio to Twilio', e?.message || e);
-          }
-        },
-        onClose: () => { elReady = false; }
-      });
+          },
+          onClose: () => { elReady = false; }
+        });
+      }
 
       return;
     }
@@ -182,6 +218,14 @@ function attachBridgeHandlers(twilioWs) {
       const muLawB64 = msg?.media?.payload;
       if (!muLawB64) return;
 
+      // Diagnostic loopback: echo caller audio right back
+      if (LOOPBACK_ONLY) {
+        sendOutboundMediaFrame(twilioWs, twilioStreamSid, muLawB64, ++outboundSeq, ++outboundChunk, outboundTimestampMs);
+        outboundTimestampMs += 20;
+        return;
+      }
+
+      // Normal EL path
       if (elWs && elWs.readyState === WebSocket.OPEN) {
         if (elReady) {
           if (elInFormat === 'ulaw_8000') {
@@ -200,6 +244,11 @@ function attachBridgeHandlers(twilioWs) {
       return;
     }
 
+    if (event === 'mark') {
+      console.log('[IN ] Twilio mark ack', msg.mark);
+      return;
+    }
+
     if (event === 'stop') {
       console.log('[TWILIO] stop', { totalMediaFrames: mediaFrames });
       try { twilioWs.close(1000, 'normal'); } catch {}
@@ -211,7 +260,7 @@ function attachBridgeHandlers(twilioWs) {
   });
 }
 
-// Send one outbound media frame to Twilio (20ms, μ-law base64)
+// Send one outbound 20ms frame (μ-law base64) to Twilio
 function sendOutboundMediaFrame(twilioWs, streamSid, payloadB64, seq, chunk, tsMs) {
   const msg = {
     event: 'media',
@@ -225,7 +274,9 @@ function sendOutboundMediaFrame(twilioWs, streamSid, payloadB64, seq, chunk, tsM
     }
   };
   twilioWs.send(JSON.stringify(msg));
-  // Optional: request an acknowledgement mark
+  console.log('[OUT] frame', { seq, chunk, tsMs, bytes: Buffer.from(payloadB64, 'base64').length });
+
+  // Ask Twilio to ack; you'll see it as event "mark" coming back
   twilioWs.send(JSON.stringify({
     event: 'mark',
     streamSid: streamSid || undefined,
@@ -233,11 +284,11 @@ function sendOutboundMediaFrame(twilioWs, streamSid, payloadB64, seq, chunk, tsM
   }));
 }
 
-// ===================== ElevenLabs ConvAI (robust connect) =====================
+// ============================================================================
+// ElevenLabs ConvAI (robust connect with voice + greeting)
+// ============================================================================
 
 function connectToElevenLabs({ agentId, mode, phone, onMetadata, onAudioFromEL, onClose }) {
-  const welcome = process.env.EL_WELCOME || "Hi there! I'm your assistant. How can I help today?";
-
   const endpoints = [
     `wss://api.elevenlabs.io/v1/convai/ws?agent_id=${encodeURIComponent(agentId)}`,
     `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(agentId)}`
@@ -269,16 +320,21 @@ function connectToElevenLabs({ agentId, mode, phone, onMetadata, onAudioFromEL, 
       clearTimeout(connectTimer);
       console.log('[EL] connected (endpoint', which === 0 ? 'ws' : 'conversation', ')');
 
-      // Send greeting/init on open
+      // Send greeting/init on open with explicit TTS voice to force audio output
       const init = {
         type: "conversation_initiation_client_data",
         conversation_config_override: {
-          agent: { first_message: welcome, language: "en" }
+          agent: { first_message: EL_WELCOME, language: "en" },
+          tts: { voice_id: EL_VOICE_ID }
         },
         dynamic_variables: { caller_phone: phone || "" }
       };
-      try { elWs.send(JSON.stringify(init)); console.log('[EL] sent conversation_initiation_client_data'); }
-      catch (e) { console.error('[EL] failed to send initiation data', e?.message || e); }
+      try {
+        elWs.send(JSON.stringify(init));
+        console.log('[EL] sent init with explicit tts.voice_id:', EL_VOICE_ID);
+      } catch (e) {
+        console.error('[EL] failed to send initiation data', e?.message || e);
+      }
 
       // If no metadata within 2s, nudge & log
       metaTimer = setTimeout(() => {
@@ -322,7 +378,7 @@ function connectToElevenLabs({ agentId, mode, phone, onMetadata, onAudioFromEL, 
 
     elWs.on('error', (err) => {
       console.error('[EL] error', err?.message || err);
-      // close handler will decide fallback
+      // close handler decides fallback
     });
   }
 
@@ -330,8 +386,11 @@ function connectToElevenLabs({ agentId, mode, phone, onMetadata, onAudioFromEL, 
   return elWs;
 }
 
-// ===================== Audio helpers (μ-law / PCM16) =====================
+// ============================================================================
+// Audio helpers (μ-law / PCM16)
+// ============================================================================
 
+// μ-law (G.711) -> PCM16 Int16Array
 function muLawToPcm16(muBuf) {
   const out = new Int16Array(muBuf.length);
   for (let i = 0; i < muBuf.length; i++) {
@@ -346,6 +405,7 @@ function muLawToPcm16(muBuf) {
   return out;
 }
 
+// PCM16 -> μ-law (Buffer of bytes)
 function pcm16ToMuLaw(pcm) {
   const out = Buffer.alloc(pcm.length);
   for (let i = 0; i < pcm.length; i++) {
@@ -363,12 +423,16 @@ function pcm16ToMuLaw(pcm) {
   return out;
 }
 
+// 8k -> 16k (duplicate samples)
 function upsamplePcm16Mono8kTo16k(pcm8k) {
   const out = new Int16Array(pcm8k.length * 2);
-  for (let i = 0, j = 0; i < pcm8k.length; i++, j += 2) { const s = pcm8k[i]; out[j] = s; out[j + 1] = s; }
+  for (let i = 0, j = 0; i < pcm8k.length; i++, j += 2) {
+    const s = pcm8k[i]; out[j] = s; out[j + 1] = s;
+  }
   return out;
 }
 
+// 16k -> 8k (drop every other sample)
 function downsamplePcm16Mono16kTo8k(pcm16kBuf) {
   const in16 = new Int16Array(pcm16kBuf.buffer, pcm16kBuf.byteOffset, Math.floor(pcm16kBuf.byteLength / 2));
   const out = new Int16Array(Math.floor(in16.length / 2));
