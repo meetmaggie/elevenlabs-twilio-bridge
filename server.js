@@ -1,4 +1,8 @@
-// server.js — Twilio <-> ElevenLabs bridge with robust 403 fallback (no crashes)
+// server.js — Twilio <-> ElevenLabs bridge (no overrides; compatible with "override not allowed")
+// - No conversation_config_override (no tts.voice_id, no first_message)
+// - Falls back /ws -> /conversation and never crashes
+// - 20ms μ-law frames to Twilio with streamSid + sequencing
+// - Optional LOOPBACK_ONLY=1 echo test
 
 const http = require('http');
 const url = require('url');
@@ -10,8 +14,6 @@ const BRIDGE_AUTH_TOKEN = process.env.BRIDGE_AUTH_TOKEN || null;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || null;
 const DISCOVERY_ID = process.env.ELEVENLABS_DISCOVERY_AGENT_ID || null;
 const DAILY_ID = process.env.ELEVENLABS_DAILY_AGENT_ID || null;
-const EL_VOICE_ID = process.env.EL_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
-const EL_WELCOME = process.env.EL_WELCOME || "Hi there! I'm your assistant. How can I help today?";
 const LOOPBACK_ONLY = (process.env.LOOPBACK_ONLY || '').trim() === '1';
 
 // ---- HTTP (health) ----
@@ -83,7 +85,8 @@ function attachBridgeHandlers(twilioWs) {
             elOutFormat = agent_output_audio_format;
             elReady = true;
             console.log('[EL] formats', { elInFormat, elOutFormat });
-            // flush buffered caller frames
+
+            // Flush buffered caller frames
             if (bufferedCaller.length) {
               console.log(`[EL] flushing ${bufferedCaller.length} buffered chunks`);
               for (const b64 of bufferedCaller) {
@@ -93,7 +96,6 @@ function attachBridgeHandlers(twilioWs) {
             }
           },
           onAudioFromEL: (audioB64) => {
-            // log and chunk to 20ms frames
             const bytes = Buffer.from(audioB64, 'base64').length;
             console.log('[EL->TWILIO] audio chunk', { len: bytes, format: elOutFormat });
             if (elOutFormat === 'ulaw_8000') {
@@ -168,7 +170,7 @@ function sendUserChunkToEL(elWs, elInFormat, muLawB64) {
   }
 }
 
-// ---- Robust EL connect with 403 fallback (and no unhandled error) ----
+// ---- Robust EL connect with fallback; NO overrides in init ----
 function connectToELWithFallback({ agentId, phone, onMetadata, onAudioFromEL }) {
   const endpoints = [
     `wss://api.elevenlabs.io/v1/convai/ws?agent_id=${encodeURIComponent(agentId)}`,
@@ -178,42 +180,36 @@ function connectToELWithFallback({ agentId, phone, onMetadata, onAudioFromEL }) 
   let which = 0;
   let elWs;
 
-  const initAndNudges = () => {
-    const init = {
-      type: "conversation_initiation_client_data",
-      conversation_config_override: {
-        agent: { first_message: EL_WELCOME, language: "en" },
-        tts:   { voice_id: EL_VOICE_ID }
-      },
-      dynamic_variables: { caller_phone: phone || "" }
-    };
-    try {
-      elWs.send(JSON.stringify(init));
-      console.log('[EL] sent init with explicit tts.voice_id:', EL_VOICE_ID);
-    } catch (e) { console.error('[EL] failed to send init', e?.message || e); }
-    // Gentle nudges if idle
-    setTimeout(() => { try { elWs.send(JSON.stringify({ type:"user_message", text:"Hello" })); console.warn('[EL] first nudge sent'); } catch {} }, 2000);
-    setTimeout(() => { try { elWs.send(JSON.stringify({ type:"user_message", text:"Are you there?" })); console.warn('[EL] second nudge sent'); } catch {} }, 3000);
-  };
-
   const connect = () => {
     const ep = endpoints[which];
     console.log('[EL] connecting', { endpoint: ep.replace(/^wss:\/\/api\.elevenlabs\.io/, '...') });
 
     elWs = new WebSocket(ep, { headers });
 
-    // IMPORTANT: attach 'error' FIRST so 403 never crashes the process
+    // Attach error FIRST so 403 never crashes the process
     elWs.on('error', (err) => {
       const msg = err?.message || String(err);
       console.error('[EL] error', msg);
       try { elWs.close(); } catch {}
-      // Fallback once if we were on /ws
       if (which === 0) { which = 1; console.log('[EL] falling back to /conversation'); setTimeout(connect, 150); }
     });
 
     elWs.on('open', () => {
       console.log('[EL] connected (endpoint', which === 0 ? 'ws' : 'conversation', ')');
-      initAndNudges();
+
+      // IMPORTANT: send *no* conversation_config_override; only dynamic_variables
+      const init = {
+        type: "conversation_initiation_client_data",
+        dynamic_variables: { caller_phone: phone || "" }
+      };
+      try {
+        elWs.send(JSON.stringify(init));
+        console.log('[EL] sent init (no overrides)');
+      } catch (e) { console.error('[EL] failed to send init', e?.message || e); }
+
+      // Gentle nudges—allowed even when overrides are blocked
+      setTimeout(() => { try { elWs.send(JSON.stringify({ type:"user_message", text:"Hello" })); console.warn('[EL] first nudge sent'); } catch {} }, 1200);
+      setTimeout(() => { try { elWs.send(JSON.stringify({ type:"user_message", text:"Are you there?" })); console.warn('[EL] second nudge sent'); } catch {} }, 2500);
     });
 
     elWs.on('message', (data) => {
@@ -239,7 +235,6 @@ function connectToELWithFallback({ agentId, phone, onMetadata, onAudioFromEL }) 
 
     elWs.on('close', (code, reason) => {
       console.log('[EL] closed', { code, reason: reason?.toString() });
-      // If first endpoint died without ever opening properly, fall back
       if (which === 0 && code !== 1000) { which = 1; console.log('[EL] closed on /ws — retrying /conversation'); setTimeout(connect, 150); }
     });
   };
@@ -264,7 +259,7 @@ function muLawToPcm16(muBuf) {
 function pcm16ToMuLaw(pcm) {
   const out = Buffer.alloc(pcm.length);
   for (let i = 0; i < pcm.length; i++) {
-    let sample = pcm[i]; let sign = (sample < 0) ? 0x80 : 0x00;
+    let sample = pcm[i]; let sign = (sample < 0) ? 0x80 : 0;
     if (sample < 0) sample = -sample; if (sample > 32635) sample = 32635;
     sample += 132; let exponent = 7;
     for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
@@ -284,4 +279,3 @@ function downsamplePcm16Mono16kTo8k(pcm16kBuf) {
   for (let i = 0, j = 0; j < out.length; i += 2, j++) out[j] = in16[i];
   return out;
 }
-
