@@ -1,11 +1,9 @@
-// server.js — Twilio <-> ElevenLabs bridge (no overrides + barge-in hint + simple VAD)
-// Env (Railway -> Variables):
-//   ELEVENLABS_API_KEY          (required)
-//   ELEVENLABS_DISCOVERY_AGENT_ID (required if not passed from Twilio)
-//   ELEVENLABS_DAILY_AGENT_ID     (optional)
-//   BRIDGE_AUTH_TOKEN             (optional)
-//   NODE_ENV=production           (recommended)
-//   LOOPBACK_ONLY=1               (optional echo test; remove for real calls)
+// server.js — Twilio <-> ElevenLabs bridge
+// - No conversation overrides (agent controls voice/greeting) -> prevents 1008
+// - Barge-in hint: send {type:"user_activity"} when caller begins speaking after EL output
+// - Simple VAD: send {type:"user_audio_end"} ~700ms after caller stops
+// - Robust fallback: /v1/convai/ws -> /v1/convai/conversation
+// - Log throttling to avoid Railway rate limits
 
 const http = require('http');
 const url = require('url');
@@ -18,6 +16,10 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || null;
 const DISCOVERY_ID = process.env.ELEVENLABS_DISCOVERY_AGENT_ID || null;
 const DAILY_ID = process.env.ELEVENLABS_DAILY_AGENT_ID || null;
 const LOOPBACK_ONLY = (process.env.LOOPBACK_ONLY || '').trim() === '1';
+
+// --- Log tuning ---
+const LOG_FRAMES_EVERY = parseInt(process.env.LOG_FRAMES_EVERY || '100', 10); // log every Nth outbound frame (default 100). Set 0 to disable.
+const LOG_MARK_ACKS = (process.env.LOG_MARK_ACKS || '0').trim() === '1'; // default off
 
 // ---------------- HTTP (health) ----------------
 const server = http.createServer((req, res) => {
@@ -57,34 +59,15 @@ function attachBridgeHandlers(twilioWs) {
   // Buffer caller frames until EL metadata arrives
   const bufferedCaller = [];
 
-  // Nudge state (to avoid double intros)
+  // Nudges / barge-in helpers
   let nudge1 = null, nudge2 = null, elSpoke = false;
-
-  // Barge-in helpers
   let elHasSpoken = false;           // agent has produced audio this turn
   let callerActiveNotified = false;  // we sent user_activity once per utterance
 
-  // Simple VAD: send user_audio_end after short silence
+  // Simple VAD
   const SILENCE_MS = 700;
   let silenceTimer = null;
   let speaking = false;
-
-  const armSilenceTimer = () => {
-    clearTimeout(silenceTimer);
-    silenceTimer = setTimeout(() => {
-      if (speaking && elWs && elWs.readyState === WebSocket.OPEN) {
-        try {
-          elWs.send(JSON.stringify({ type: "user_audio_end" }));
-          console.log('[VAD] user_audio_end sent (silence)');
-        } catch (e) {
-          console.warn('[VAD] failed to send user_audio_end', e?.message || e);
-        }
-        speaking = false;
-        // allow sending user_activity again on next utterance
-        callerActiveNotified = false;
-      }
-    }, SILENCE_MS);
-  };
 
   twilioWs.on('message', (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
@@ -120,30 +103,21 @@ function attachBridgeHandlers(twilioWs) {
 
         elWs = connectToELWithFallback({
           agentId, phone,
-          onOpen: () => {
-            // Init WITHOUT overrides (agent controls voice/greeting/policy)
+          onOpen: (ws) => {
+            // Init WITHOUT overrides (agent config rules)
             const init = {
               type: "conversation_initiation_client_data",
               dynamic_variables: { caller_phone: phone || "" }
             };
-            try {
-              elWs.send(JSON.stringify(init));
-              console.log('[EL] sent init (no overrides)');
-            } catch (e) {
-              console.error('[EL] failed to send init', e?.message || e);
-            }
+            try { ws.send(JSON.stringify(init)); console.log('[EL] sent init (no overrides)'); } 
+            catch (e) { console.error('[EL] failed to send init', e?.message || e); }
+
             // Gentle nudges ONLY if EL hasn't spoken yet; cancel once audio arrives
             nudge1 = setTimeout(() => {
-              if (!elSpoke) {
-                try { elWs.send(JSON.stringify({ type:"user_message", text:"Hello" })); } catch {}
-                console.warn('[EL] first nudge sent');
-              }
+              if (!elSpoke) { try { ws.send(JSON.stringify({ type:"user_message", text:"Hello" })); } catch {} console.warn('[EL] first nudge sent'); }
             }, 1200);
             nudge2 = setTimeout(() => {
-              if (!elSpoke) {
-                try { elWs.send(JSON.stringify({ type:"user_message", text:"Are you there?" })); } catch {}
-                console.warn('[EL] second nudge sent');
-              }
+              if (!elSpoke) { try { ws.send(JSON.stringify({ type:"user_message", text:"Are you there?" })); } catch {} console.warn('[EL] second nudge sent'); }
             }, 2500);
           },
           onMetadata: ({ user_input_audio_format, agent_output_audio_format }) => {
@@ -166,7 +140,9 @@ function attachBridgeHandlers(twilioWs) {
             clearTimeout(nudge2);
 
             const bytes = Buffer.from(audioB64, 'base64').length;
-            console.log('[EL->TWILIO] audio chunk', { len: bytes, format: elOutFormat });
+            if (LOG_FRAMES_EVERY !== 0) {
+              console.log('[EL->TWILIO] audio chunk', { len: bytes, format: elOutFormat });
+            }
 
             if (elOutFormat === 'ulaw_8000') {
               const u = Buffer.from(audioB64, 'base64');
@@ -194,25 +170,29 @@ function attachBridgeHandlers(twilioWs) {
     if (event === 'media') {
       const muLawB64 = msg?.media?.payload; if (!muLawB64) return;
 
-      // mark caller speaking + arm VAD
+      // mark caller speaking + arm VAD to send end after silence
       if (!speaking) {
         speaking = true;
         console.log('[VAD] user_started_speaking');
       }
-      armSilenceTimer();
+      clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        if (speaking && elWs && elWs.readyState === WebSocket.OPEN) {
+          try { elWs.send(JSON.stringify({ type: "user_audio_end" })); console.log('[VAD] user_audio_end sent (silence)'); } catch {}
+          speaking = false;
+          callerActiveNotified = false;
+        }
+      }, SILENCE_MS);
 
       // If agent has spoken and we haven't hinted yet, send user_activity (barge-in hint)
       if (elHasSpoken && !callerActiveNotified && elWs && elWs.readyState === WebSocket.OPEN) {
-        try {
-          elWs.send(JSON.stringify({ type: "user_activity" }));
-          callerActiveNotified = true;
-          console.log('[EL] user_activity sent (caller started talking)');
-        } catch {}
+        try { elWs.send(JSON.stringify({ type: "user_activity" })); console.log('[EL] user_activity sent (caller started talking)'); } catch {}
+        callerActiveNotified = true;
       }
 
       if (LOOPBACK_ONLY) {
         sendOutboundFrame(twilioWs, twilioStreamSid, muLawB64, ++seq, ++chunk, tsMs);
-        tsMs += 20;
+        tsMs += 20; 
         return;
       }
 
@@ -226,7 +206,11 @@ function attachBridgeHandlers(twilioWs) {
       return;
     }
 
-    if (event === 'mark') { console.log('[IN ] Twilio mark ack', msg.mark); return; }
+    if (event === 'mark') {
+      if (LOG_MARK_ACKS) console.log('[IN ] Twilio mark ack', msg.mark);
+      return;
+    }
+
     if (event === 'stop') {
       clearTimeout(silenceTimer);
       clearTimeout(nudge1);
@@ -246,8 +230,11 @@ function sendOutboundFrame(twilioWs, streamSid, payloadB64, seq, chunk, tsMs) {
     sequenceNumber: String(seq),
     media: { track: 'outbound', chunk: String(chunk), timestamp: String(tsMs), payload: payloadB64 }
   }));
+  // Ask Twilio to ack (we suppress logs unless LOG_MARK_ACKS=1)
   twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `el-chunk-${chunk}` }}));
-  console.log('[OUT] frame', { seq, chunk, tsMs, bytes: Buffer.from(payloadB64, 'base64').length });
+  if (LOG_FRAMES_EVERY > 0 && (seq % LOG_FRAMES_EVERY === 0)) {
+    console.log('[OUT] frame', { seq, chunk, tsMs, bytes: Buffer.from(payloadB64, 'base64').length });
+  }
 }
 
 // -------------- Forward caller audio to EL in correct format --------------
@@ -289,14 +276,7 @@ function connectToELWithFallback({ agentId, phone, onOpen, onMetadata, onAudioFr
 
     elWs.on('open', () => {
       console.log('[EL] connected (endpoint', which === 0 ? 'ws' : 'conversation', ')');
-      try { onOpen && onOpen(); } catch {}
-      // Send init with ONLY dynamic variables (no overrides)
-      const init = {
-        type: "conversation_initiation_client_data",
-        dynamic_variables: { caller_phone: phone || "" }
-      };
-      try { elWs.send(JSON.stringify(init)); console.log('[EL] sent init (no overrides)'); }
-      catch (e) { console.error('[EL] failed to send init', e?.message || e); }
+      try { onOpen && onOpen(elWs); } catch {}
     });
 
     elWs.on('message', (data) => {
@@ -366,4 +346,3 @@ function downsamplePcm16Mono16kTo8k(pcm16kBuf) {
   for (let i = 0, j = 0; j < out.length; i += 2, j++) out[j] = in16[i];
   return out;
 }
-
