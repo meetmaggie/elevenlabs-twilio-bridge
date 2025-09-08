@@ -635,6 +635,8 @@ function attachBridgeHandlers(twilioWs, query = {}) {
             clearTimeout(nudge3);
           }
 
+          // Track when agent finishes speaking for VAD
+          lastAgentAudioTime = Date.now();
           resetUtterance();
           
           const audioB64 = message.audio_event.audio_base_64;
