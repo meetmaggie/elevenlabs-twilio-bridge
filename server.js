@@ -364,8 +364,8 @@ function attachBridgeHandlers(twilioWs, query = {}) {
       
       // Trigger user speech detection if:
       // 1. Not currently speaking AND
-      // 2. Either enough time passed since agent spoke (500ms) OR agent hasn't spoken yet
-      if (!speaking && (timeSinceLastAgent > 500 || !elHasSpoken)) {
+      // 2. Either enough time passed since agent spoke (500ms) OR agent hasn't spoken yet OR EL not ready
+      if (!speaking && (timeSinceLastAgent > 500 || !elHasSpoken || !elOpen)) {
         speaking = true;
         userHasSpoken = true;
         log('VAD', 'User started speaking', { 
