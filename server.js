@@ -1,6 +1,7 @@
 // server.js — Twilio <-> ElevenLabs bridge
-// No overrides + barge-in helpers + explicit user_audio_start/end + log throttling
-// Includes: RESET utterance when EL audio starts (prevents "stuck speaking" after intro)
+// Fix: send audio with { type:"audio", audio_event:{ audio_base_64 } } schema
+// Keeps: no overrides, ws->conversation fallback, barge-in hint, explicit start/end,
+//        log throttling, and "reset utterance on first EL audio".
 
 const http = require('http');
 const url = require('url');
@@ -140,7 +141,7 @@ function attachBridgeHandlers(twilioWs) {
             elSpoke = true; elHasSpoken = true;
             clearTimeout(nudge1); clearTimeout(nudge2);
 
-            // >>> RESET for agent turn: ensure user's next words start a NEW utterance
+            // RESET for agent turn (prevents us from thinking user is already speaking)
             resetUtterance();
             console.log('[VAD] reset_for_agent_turn');
 
@@ -208,6 +209,7 @@ function attachBridgeHandlers(twilioWs) {
 
       if (elWs && elWs.readyState === WebSocket.OPEN) {
         if (elReady) {
+          // >>>>> THE IMPORTANT CHANGE: send audio with structured schema
           sendUserChunkToEL(elWs, elInFormat, muLawB64);
         } else {
           bufferedCaller.push(muLawB64);
@@ -244,15 +246,26 @@ function sendOutboundFrame(twilioWs, streamSid, payloadB64, seq, chunk, tsMs) {
 
 // -------------- Forward caller audio to EL in correct format --------------
 function sendUserChunkToEL(elWs, elInFormat, muLawB64) {
+  // If EL expects ulaw_8000 (your metadata shows that), we can forward as-is in the new schema.
   if (elInFormat === 'ulaw_8000') {
-    elWs.send(JSON.stringify({ user_audio_chunk: muLawB64 }));
-  } else {
-    const muLawBuf  = Buffer.from(muLawB64, 'base64');
-    const pcm16_8k  = muLawToPcm16(muLawBuf);
-    const pcm16_16k = upsamplePcm16Mono8kTo16k(pcm16_8k);
-    const b64_16k   = Buffer.from(pcm16_16k.buffer, pcm16_16k.byteOffset, pcm16_16k.byteLength).toString('base64');
-    elWs.send(JSON.stringify({ user_audio_chunk: b64_16k }));
+    // Newer schema (most reliable): type: "audio"
+    elWs.send(JSON.stringify({
+      type: "audio",
+      audio_event: { audio_base_64: muLawB64 }
+    }));
+    return;
   }
+
+  // Otherwise convert to 16k PCM and send with the same schema
+  const muLawBuf  = Buffer.from(muLawB64, 'base64');
+  const pcm16_8k  = muLawToPcm16(muLawBuf);
+  const pcm16_16k = upsamplePcm16Mono8kTo16k(pcm16_8k);
+  const b64_16k   = Buffer.from(pcm16_16k.buffer, pcm16_16k.byteOffset, pcm16_16k.byteLength).toString('base64');
+
+  elWs.send(JSON.stringify({
+    type: "audio",
+    audio_event: { audio_base_64: b64_16k }
+  }));
 }
 
 // -------------- Robust EL connect with fallback; no overrides --------------
@@ -291,15 +304,24 @@ function connectToELWithFallback({ agentId, phone, onOpen, onMetadata, onAudioFr
       if (obj?.type === 'conversation_initiation_metadata') {
         const meta = obj.conversation_initiation_metadata_event || {};
         console.log('[EL] metadata', meta);
-        try { onMetadata && onMetadata({ user_input_audio_format: meta.user_input_audio_format, agent_output_audio_format: meta.agent_output_audio_format }); } catch {}
+        try { onMetadata && onMetadata({
+          user_input_audio_format: meta.user_input_audio_format,
+          agent_output_audio_format: meta.agent_output_audio_format
+        }); } catch {}
         return;
       }
       if (obj?.type === 'audio' && obj.audio_event?.audio_base_64) {
         try { onAudioFromEL && onAudioFromEL(obj.audio_event.audio_base_64); } catch {}
         return;
       }
-      if (obj?.type === 'user_transcript') { console.log('[EL] user_transcript:', obj.user_transcription_event?.user_transcript); return; }
-      if (obj?.type === 'agent_response') { console.log('[EL] agent_response:', obj.agent_response_event?.agent_response); return; }
+      if (obj?.type === 'user_transcript') {
+        console.log('[EL] user_transcript:', obj.user_transcription_event?.user_transcript);
+        return;
+      }
+      if (obj?.type === 'agent_response') {
+        console.log('[EL] agent_response:', obj.agent_response_event?.agent_response);
+        return;
+      }
       if (obj?.type === 'ping') { try { elWs.send(JSON.stringify({ type:'pong', event_id: obj.ping_event?.event_id })); } catch {} return; }
 
       console.log('[EL] event (unhandled)', obj);
@@ -351,3 +373,4 @@ function downsamplePcm16Mono16kTo8k(pcm16kBuf) {
   for (let i = 0, j = 0; j < out.length; i += 2, j++) out[j] = in16[i];
   return out;
 }
+
