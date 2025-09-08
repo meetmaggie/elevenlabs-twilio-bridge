@@ -1,8 +1,11 @@
-// server.js — Twilio <-> ElevenLabs bridge (no overrides; compatible with "override not allowed")
-// - No conversation_config_override (no tts.voice_id, no first_message)
-// - Falls back /ws -> /conversation and never crashes
-// - 20ms μ-law frames to Twilio with streamSid + sequencing
-// - Optional LOOPBACK_ONLY=1 echo test
+// server.js — Twilio <-> ElevenLabs bridge
+// - No conversation_config_override (agent controls voice/greeting)
+// - Nudges auto-cancel once EL speaks (prevents repeated intros)
+// - Barge-in hint: send {type:"user_activity"} when caller begins speaking after EL output
+// - Simple VAD: send {type:"user_audio_end"} ~700ms after caller stops
+// - 20ms μ-law outbound frames with sequencing + Twilio 'mark' acks
+// - Robust fallback: /v1/convai/ws -> /v1/convai/conversation
+// - Optional LOOPBACK_ONLY=1 to echo caller audio (diagnostic)
 
 const http = require('http');
 const url = require('url');
@@ -16,14 +19,14 @@ const DISCOVERY_ID = process.env.ELEVENLABS_DISCOVERY_AGENT_ID || null;
 const DAILY_ID = process.env.ELEVENLABS_DAILY_AGENT_ID || null;
 const LOOPBACK_ONLY = (process.env.LOOPBACK_ONLY || '').trim() === '1';
 
-// ---- HTTP (health) ----
+// ---------- HTTP ----------
 const server = http.createServer((req, res) => {
   if (req.url === '/health') return res.writeHead(200, {'Content-Type':'text/plain'}).end('ok');
   if (req.url === '/' || req.url === '/status') return res.writeHead(200, {'Content-Type':'text/plain'}).end('voice-bridge: up');
   res.writeHead(404, {'Content-Type':'text/plain'}).end('not found');
 });
 
-// ---- WS endpoint for Twilio ----
+// ---------- WS endpoint ----------
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
@@ -35,13 +38,15 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', (twilioWs) => attachBridgeHandlers(twilioWs));
 
+// ---------- Lifecycle ----------
 setInterval(() => console.log('[HEARTBEAT] alive', new Date().toISOString()), 60_000);
 process.on('SIGTERM', () => { try { server.close(() => process.exit(0)); } catch { process.exit(0); }});
 server.listen(PORT, () => console.log(`[HTTP] listening on :${PORT}`));
 
-// ---- Bridge core ----
+// ============================================================================
+// Bridge core
+// ============================================================================
 function attachBridgeHandlers(twilioWs) {
-  let sawFirstMedia = false;
   let twilioStreamSid = null;
   let agentId = null, mode = 'discovery', phone = '', persist = '0';
 
@@ -49,11 +54,37 @@ function attachBridgeHandlers(twilioWs) {
   let elWs = null, elReady = false;
   let elInFormat = null, elOutFormat = null;
 
-  // Outbound frame sequencing
+  // Outbound frames → Twilio
   let seq = 0, chunk = 0, tsMs = 0;
 
-  // Buffer caller frames until EL metadata
+  // Buffer caller audio until EL metadata arrives
   const bufferedCaller = [];
+
+  // Nudges / barge-in helpers
+  let nudge1 = null, nudge2 = null, elSpoke = false;
+  let elHasSpoken = false;          // set after we see first EL audio
+
+  // Simple silence VAD
+  const SILENCE_MS = 700;           // end-of-utterance after 0.7s of no caller frames
+  let silenceTimer = null;
+  let speaking = false;             // caller currently speaking
+  let callerActiveNotified = false; // we sent user_activity once per EL-speech
+
+  const armSilenceTimer = () => {
+    clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => {
+      if (speaking && elWs && elWs.readyState === WebSocket.OPEN) {
+        try {
+          elWs.send(JSON.stringify({ type: "user_audio_end" }));
+          console.log('[VAD] user_audio_end sent (silence)');
+        } catch (e) {
+          console.warn('[VAD] failed to send user_audio_end', e?.message || e);
+        }
+        speaking = false;
+        callerActiveNotified = false; // allow notifying again next time
+      }
+    }, SILENCE_MS);
+  };
 
   twilioWs.on('message', (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
@@ -71,33 +102,51 @@ function attachBridgeHandlers(twilioWs) {
       persist = cp.persist === '1' ? '1' : '0';
       console.log('[TWILIO] start', { streamSid: twilioStreamSid, agentId, phone, LOOPBACK_ONLY });
 
+      // Reset per-call state
+      seq = 0; chunk = 0; tsMs = 0;
+      speaking = false;
+      callerActiveNotified = false;
+      clearTimeout(silenceTimer);
+
       if (!LOOPBACK_ONLY) {
         if (!ELEVENLABS_API_KEY) { console.error('❌ Missing ELEVENLABS_API_KEY'); return; }
         if (!agentId)            { console.error('❌ Missing agentId'); return; }
-        // Reset outbound sequence each call
-        seq = 0; chunk = 0; tsMs = 0;
 
-        // Connect to EL with robust fallback and no unhandled error
         elWs = connectToELWithFallback({
           agentId, phone,
+          onOpen: (ws) => {
+            // send init WITHOUT any overrides (agent config rules)
+            const init = { type: "conversation_initiation_client_data", dynamic_variables: { caller_phone: phone || "" } };
+            try { ws.send(JSON.stringify(init)); console.log('[EL] sent init (no overrides)'); } catch (e) { console.error('[EL] init send failed', e?.message || e); }
+
+            // light nudges only if EL stays quiet (will auto-cancel once EL speaks)
+            nudge1 = setTimeout(() => {
+              if (!elSpoke) { try { ws.send(JSON.stringify({ type:"user_message", text:"Hello" })); } catch {} console.warn('[EL] first nudge sent'); }
+            }, 1200);
+            nudge2 = setTimeout(() => {
+              if (!elSpoke) { try { ws.send(JSON.stringify({ type:"user_message", text:"Are you there?" })); } catch {} console.warn('[EL] second nudge sent'); }
+            }, 2500);
+          },
           onMetadata: ({ user_input_audio_format, agent_output_audio_format }) => {
             elInFormat  = user_input_audio_format;
             elOutFormat = agent_output_audio_format;
             elReady = true;
             console.log('[EL] formats', { elInFormat, elOutFormat });
 
-            // Flush buffered caller frames
+            // Flush any caller audio buffered before metadata
             if (bufferedCaller.length) {
               console.log(`[EL] flushing ${bufferedCaller.length} buffered chunks`);
-              for (const b64 of bufferedCaller) {
-                sendUserChunkToEL(elWs, elInFormat, b64);
-              }
+              for (const b64 of bufferedCaller) sendUserChunkToEL(elWs, elInFormat, b64);
               bufferedCaller.length = 0;
             }
           },
           onAudioFromEL: (audioB64) => {
+            elSpoke = true; elHasSpoken = true;
+            clearTimeout(nudge1); clearTimeout(nudge2);
+
             const bytes = Buffer.from(audioB64, 'base64').length;
             console.log('[EL->TWILIO] audio chunk', { len: bytes, format: elOutFormat });
+
             if (elOutFormat === 'ulaw_8000') {
               const u = Buffer.from(audioB64, 'base64');
               for (let off = 0; off < u.length; off += 160) {
@@ -122,30 +171,55 @@ function attachBridgeHandlers(twilioWs) {
     }
 
     if (event === 'media') {
-      if (!sawFirstMedia) { sawFirstMedia = true; console.log('[TWILIO] first media frame received'); }
       const muLawB64 = msg?.media?.payload; if (!muLawB64) return;
+
+      // Mark caller speaking + barge-in hint
+      if (!speaking) {
+        speaking = true;
+        console.log('[VAD] user_started_speaking');
+        if (elHasSpoken && !callerActiveNotified && elWs && elWs.readyState === WebSocket.OPEN) {
+          try { elWs.send(JSON.stringify({ type: "user_activity" })); console.log('[EL] user_activity sent (caller started talking)'); }
+          catch {}
+          callerActiveNotified = true;
+        }
+      }
+      // Arm silence timer to send user_audio_end if caller stops
+      clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        if (speaking && elWs && elWs.readyState === WebSocket.OPEN) {
+          try { elWs.send(JSON.stringify({ type: "user_audio_end" })); console.log('[VAD] user_audio_end sent (silence)'); } catch {}
+          speaking = false;
+          callerActiveNotified = false;
+        }
+      }, SILENCE_MS);
 
       if (LOOPBACK_ONLY) {
         sendOutboundFrame(twilioWs, twilioStreamSid, muLawB64, ++seq, ++chunk, tsMs);
-        tsMs += 20; return;
+        tsMs += 20; 
+        return;
       }
 
       if (elWs && elWs.readyState === WebSocket.OPEN) {
-        if (elReady) {
-          sendUserChunkToEL(elWs, elInFormat, muLawB64);
-        } else {
-          bufferedCaller.push(muLawB64);
-        }
+        if (elReady) { sendUserChunkToEL(elWs, elInFormat, muLawB64); }
+        else { bufferedCaller.push(muLawB64); }
       }
       return;
     }
 
     if (event === 'mark') { console.log('[IN ] Twilio mark ack', msg.mark); return; }
-    if (event === 'stop') { try { twilioWs.close(1000); } catch {} try { elWs && elWs.close(1000); } catch {} return; }
+
+    if (event === 'stop') {
+      clearTimeout(silenceTimer); clearTimeout(nudge1); clearTimeout(nudge2);
+      try { twilioWs.close(1000); } catch {}
+      try { elWs && elWs.close(1000); } catch {}
+      return;
+    }
   });
 }
 
-// ---- Send one 20ms frame to Twilio ----
+// ============================================================================
+// Outbound helpers (Twilio)
+// ============================================================================
 function sendOutboundFrame(twilioWs, streamSid, payloadB64, seq, chunk, tsMs) {
   twilioWs.send(JSON.stringify({
     event: 'media',
@@ -157,7 +231,7 @@ function sendOutboundFrame(twilioWs, streamSid, payloadB64, seq, chunk, tsMs) {
   console.log('[OUT] frame', { seq, chunk, tsMs, bytes: Buffer.from(payloadB64, 'base64').length });
 }
 
-// ---- Forward caller audio to EL in correct format ----
+// Forward caller audio to EL in correct format
 function sendUserChunkToEL(elWs, elInFormat, muLawB64) {
   if (elInFormat === 'ulaw_8000') {
     elWs.send(JSON.stringify({ user_audio_chunk: muLawB64 }));
@@ -170,8 +244,10 @@ function sendUserChunkToEL(elWs, elInFormat, muLawB64) {
   }
 }
 
-// ---- Robust EL connect with fallback; NO overrides in init ----
-function connectToELWithFallback({ agentId, phone, onMetadata, onAudioFromEL }) {
+// ============================================================================
+// ElevenLabs connect (robust; no overrides)
+// ============================================================================
+function connectToELWithFallback({ agentId, phone, onOpen, onMetadata, onAudioFromEL }) {
   const endpoints = [
     `wss://api.elevenlabs.io/v1/convai/ws?agent_id=${encodeURIComponent(agentId)}`,
     `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(agentId)}`
@@ -186,7 +262,7 @@ function connectToELWithFallback({ agentId, phone, onMetadata, onAudioFromEL }) 
 
     elWs = new WebSocket(ep, { headers });
 
-    // Attach error FIRST so 403 never crashes the process
+    // Attach error FIRST so 403 etc never crash the process
     elWs.on('error', (err) => {
       const msg = err?.message || String(err);
       console.error('[EL] error', msg);
@@ -196,20 +272,7 @@ function connectToELWithFallback({ agentId, phone, onMetadata, onAudioFromEL }) 
 
     elWs.on('open', () => {
       console.log('[EL] connected (endpoint', which === 0 ? 'ws' : 'conversation', ')');
-
-      // IMPORTANT: send *no* conversation_config_override; only dynamic_variables
-      const init = {
-        type: "conversation_initiation_client_data",
-        dynamic_variables: { caller_phone: phone || "" }
-      };
-      try {
-        elWs.send(JSON.stringify(init));
-        console.log('[EL] sent init (no overrides)');
-      } catch (e) { console.error('[EL] failed to send init', e?.message || e); }
-
-      // Gentle nudges—allowed even when overrides are blocked
-      setTimeout(() => { try { elWs.send(JSON.stringify({ type:"user_message", text:"Hello" })); console.warn('[EL] first nudge sent'); } catch {} }, 1200);
-      setTimeout(() => { try { elWs.send(JSON.stringify({ type:"user_message", text:"Are you there?" })); console.warn('[EL] second nudge sent'); } catch {} }, 2500);
+      try { onOpen && onOpen(elWs); } catch {}
     });
 
     elWs.on('message', (data) => {
@@ -243,7 +306,9 @@ function connectToELWithFallback({ agentId, phone, onMetadata, onAudioFromEL }) 
   return elWs;
 }
 
-// ---- Audio helpers ----
+// ============================================================================
+// Audio helpers (μ-law / PCM16) — fast & simple
+// ============================================================================
 function muLawToPcm16(muBuf) {
   const out = new Int16Array(muBuf.length);
   for (let i = 0; i < muBuf.length; i++) {
@@ -259,23 +324,11 @@ function muLawToPcm16(muBuf) {
 function pcm16ToMuLaw(pcm) {
   const out = Buffer.alloc(pcm.length);
   for (let i = 0; i < pcm.length; i++) {
-    let sample = pcm[i]; let sign = (sample < 0) ? 0x80 : 0;
-    if (sample < 0) sample = -sample; if (sample > 32635) sample = 32635;
-    sample += 132; let exponent = 7;
+    let sample = pcm[i]; let sign = (sample < 0) ? 0x80 : 0x00;
+    if (sample < 0) sample = -sample;
+    if (sample > 32635) sample = 32635;
+    sample += 132;
+    let exponent = 7;
     for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
-    const mantissa = (sample >> (exponent + 3)) & 0x0F;
-    out[i] = ~(sign | (exponent << 4) | mantissa) & 0xFF;
-  }
-  return out;
-}
-function upsamplePcm16Mono8kTo16k(pcm8k) {
-  const out = new Int16Array(pcm8k.length * 2);
-  for (let i = 0, j = 0; i < pcm8k.length; i++, j += 2) { const s = pcm8k[i]; out[j] = s; out[j+1] = s; }
-  return out;
-}
-function downsamplePcm16Mono16kTo8k(pcm16kBuf) {
-  const in16 = new Int16Array(pcm16kBuf.buffer, pcm16kBuf.byteOffset, Math.floor(pcm16kBuf.byteLength / 2));
-  const out = new Int16Array(Math.floor(in16.length / 2));
-  for (let i = 0, j = 0; j < out.length; i += 2, j++) out[j] = in16[i];
-  return out;
-}
+    const mantissa = (sample >> (exponent + 3))
+
