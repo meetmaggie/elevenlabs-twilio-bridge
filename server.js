@@ -1,8 +1,13 @@
-// server.js — Twilio <-> ElevenLabs bridge (buffered + guaranteed turn end)
-// - Buffered μ-law -> ~200ms packets to EL
-// - Sends user_audio_start immediately when user speaks
-// - Sends user_audio_end on silence OR hard cap (prevents stuck turns)
-// - No overrides (avoids 1008), ws->conversation fallback, intro reset, throttled logs
+// server.js — Twilio <-> ElevenLabs bridge
+// Buffered caller audio + guaranteed turn end + post-end "wake-up" user_message.
+//
+// What’s special here:
+//  - Buffers μ-law 20ms frames into ~200ms packets and streams to EL
+//  - Sends user_audio_start when caller begins talking
+//  - Ends turn on silence OR a hard cap
+//  - **NEW:** After user_audio_end, sends a small user_message ("(caller finished speaking)")
+//             to reliably wake EL to transcribe/respond even if auto-listen is off
+//  - No config overrides (avoids 1008), ws->conversation fallback, intro-turn reset, throttled logs
 
 const http = require('http');
 const url = require('url');
@@ -17,13 +22,13 @@ const DAILY_ID = process.env.ELEVENLABS_DAILY_AGENT_ID || null;
 
 const LOOPBACK_ONLY = (process.env.LOOPBACK_ONLY || '').trim() === '1';
 
-// Tuning
+// Tuning (set these as Railway Variables to tweak without code changes)
 const LOG_FRAMES_EVERY = parseInt(process.env.LOG_FRAMES_EVERY || '100', 10); // 0=off
-const LOG_MARK_ACKS = (process.env.LOG_MARK_ACKS || '0').trim() === '1';
-const SILENCE_MS = parseInt(process.env.SILENCE_MS || '500', 10);      // end turn after this much silence
-const EL_BUFFER_MS = parseInt(process.env.EL_BUFFER_MS || '200', 10);  // packet size we send to EL
-const UTTER_MAX_MS = parseInt(process.env.UTTER_MAX_MS || '1500', 10); // hard cap per user turn (very important)
-const FRAMES_PER_PACKET = Math.max(1, Math.round(EL_BUFFER_MS / 20));  // 10 for 200ms
+const LOG_MARK_ACKS     = (process.env.LOG_MARK_ACKS || '0').trim() === '1';
+const SILENCE_MS        = parseInt(process.env.SILENCE_MS || '400', 10); // end turn after this much silence
+const EL_BUFFER_MS      = parseInt(process.env.EL_BUFFER_MS || '200', 10); // packet size we send to EL
+const UTTER_MAX_MS      = parseInt(process.env.UTTER_MAX_MS || '1500', 10); // hard cap per user turn
+const FRAMES_PER_PACKET = Math.max(1, Math.round(EL_BUFFER_MS / 20));       // 10 for 200ms
 
 // ---------- HTTP ----------
 const server = http.createServer((req, res) => {
@@ -46,7 +51,7 @@ wss.on('connection', (twilioWs) => attachBridgeHandlers(twilioWs));
 // ---------- Lifecycle ----------
 setInterval(() => console.log('[HEARTBEAT] alive', new Date().toISOString()), 60_000);
 process.on('SIGTERM', () => { try { server.close(() => process.exit(0)); } catch { process.exit(0); }});
-server.listen(PORT, () => console.log(`[HTTP] listening on :${PORT}`));
+server.listen(PORT, () => console.log(`[HTTP] listening on :${PORT}`, { SILENCE_MS, EL_BUFFER_MS, UTTER_MAX_MS, FRAMES_PER_PACKET }));
 
 // ================== Bridge core ==================
 function attachBridgeHandlers(twilioWs) {
@@ -87,7 +92,7 @@ function attachBridgeHandlers(twilioWs) {
     const merged = Buffer.concat(elBuffer);
     const ms = elBufferedFrames * 20;
 
-    if (!elOpen) { console.log(`[BUF] ${label} skipped — EL socket not open`, { ms, bytes: merged.length }); return; }
+    if (!elOpen)  { console.log(`[BUF] ${label} skipped — EL socket not open`, { ms, bytes: merged.length }); return; }
     if (!elReady) { console.log(`[BUF] ${label} deferred — EL not ready`, { ms, bytes: merged.length }); return; }
 
     try {
@@ -118,10 +123,10 @@ function attachBridgeHandlers(twilioWs) {
       twilioStreamSid = msg.streamSid || start.streamSid || null;
 
       const cp = start.customParameters || {};
-      mode  = (cp.mode || 'discovery').toLowerCase();
+      mode   = (cp.mode || 'discovery').toLowerCase();
       agentId = cp.agent_id || (mode === 'daily' ? (process.env.ELEVENLABS_DAILY_AGENT_ID || null)
                                                   : (process.env.ELEVENLABS_DISCOVERY_AGENT_ID || null));
-      phone = cp.caller_phone || '';
+      phone  = cp.caller_phone || '';
 
       console.log('[TWILIO] start', { streamSid: twilioStreamSid, agentId, phone, LOOPBACK_ONLY, FRAMES_PER_PACKET });
 
@@ -155,7 +160,7 @@ function attachBridgeHandlers(twilioWs) {
             elOutFormat = agent_output_audio_format;
             elReady = true;
             console.log('[EL] formats', { elInFormat, elOutFormat, bufferedMs: FRAMES_PER_PACKET * 20 });
-            if (elBufferedFrames) flushElBuffer('onMetadata'); // drain anything captured before ready
+            if (elBufferedFrames) flushElBuffer('onMetadata');
           },
           onAudioFromEL: (audioB64) => {
             elHasSpoken = true;
@@ -197,23 +202,19 @@ function attachBridgeHandlers(twilioWs) {
         speaking = true;
         console.log('[VAD] user_started_speaking');
 
-        // Send start **even if** EL isn't "open" yet; EL will accept once ready.
-        try {
-          if (elWs) { elWs.send(JSON.stringify({ type: "user_audio_start" })); console.log('[VAD] user_audio_start sent'); }
-        } catch {}
+        // Send start even if EL isn't open yet; EL will accept once ready.
+        try { if (elWs) { elWs.send(JSON.stringify({ type: "user_audio_start" })); console.log('[VAD] user_audio_start sent'); } } catch {}
 
         if (elHasSpoken && !callerActiveNotified && elWs) {
           try { elWs.send(JSON.stringify({ type: "user_activity" })); console.log('[EL] user_activity sent (caller started talking)'); } catch {}
           callerActiveNotified = true;
         }
 
-        // Hard cap: guarantee a turn end even if no silence is detected
+        // Hard cap: guarantee a turn end even if no silence detected
         clearTimeout(utterCapTimer);
         utterCapTimer = setTimeout(() => {
           console.warn('[VAD] hard_cap user_audio_end');
-          flushElBuffer('hardcap');
-          try { elWs && elWs.send(JSON.stringify({ type: "user_audio_end" })); console.log('[VAD] user_audio_end sent (hard cap)'); } catch {}
-          resetUtterance();
+          endUserTurn('hardcap');
         }, UTTER_MAX_MS);
       }
 
@@ -235,13 +236,7 @@ function attachBridgeHandlers(twilioWs) {
 
       // Silence-based end
       clearTimeout(silenceTimer);
-      silenceTimer = setTimeout(() => {
-        if (speaking) {
-          flushElBuffer('silence-final');
-          try { elWs && elWs.send(JSON.stringify({ type: "user_audio_end" })); console.log('[VAD] user_audio_end sent (silence)'); } catch {}
-          resetUtterance();
-        }
-      }, SILENCE_MS);
+      silenceTimer = setTimeout(() => endUserTurn('silence-final'), SILENCE_MS);
 
       return;
     }
@@ -253,11 +248,31 @@ function attachBridgeHandlers(twilioWs) {
       clearTimeout(utterCapTimer);
       clearTimeout(nudge1); clearTimeout(nudge2);
       flushElBuffer('stop');
+      try { elWs && elWs.send(JSON.stringify({ type: "user_audio_end" })); } catch {}
+      // NEW: wake-up nudge on stop as well
+      try { elWs && elWs.send(JSON.stringify({ type: "user_message", text: "(caller finished speaking)" })); console.log('[NUDGE] user_message sent (stop)'); } catch {}
       try { twilioWs.close(1000); } catch {}
       try { elWs && elWs.close(1000); } catch {}
       return;
     }
   });
+
+  // ---- helpers ----
+  function endUserTurn(label) {
+    // Final flush BEFORE end
+    flushElBuffer(label);
+    // End signal
+    try {
+      elWs && elWs.send(JSON.stringify({ type: "user_audio_end" }));
+      console.log(`[VAD] user_audio_end sent (${label.includes('hard') ? 'hard cap' : 'silence'})`);
+    } catch {}
+    // NEW: post-end wake-up nudge (forces EL to process what we just sent)
+    try {
+      elWs && elWs.send(JSON.stringify({ type: "user_message", text: "(caller finished speaking)" }));
+      console.log('[NUDGE] user_message sent (post-end)');
+    } catch {}
+    resetUtterance();
+  }
 }
 
 // ---------- Outbound frame to Twilio (20ms) ----------
@@ -332,18 +347,6 @@ function connectToELWithFallback({ agentId, phone, onOpen, onMetadata, onAudioFr
 }
 
 // ================== Audio helpers ==================
-function muLawToPcm16(muBuf) {
-  const out = new Int16Array(muBuf.length);
-  for (let i = 0; i < muBuf.length; i++) {
-    const u = muBuf[i]; let x = ~u;
-    const sign = (x & 0x80) ? -1 : 1;
-    const exponent = (x >> 4) & 0x07;
-    const mantissa = x & 0x0F;
-    const magnitude = ((mantissa << 1) + 1) << (exponent + 2);
-    out[i] = sign * (magnitude - 132);
-  }
-  return out;
-}
 function pcm16ToMuLaw(pcm) {
   const out = Buffer.alloc(pcm.length);
   for (let i = 0; i < pcm.length; i++) {
