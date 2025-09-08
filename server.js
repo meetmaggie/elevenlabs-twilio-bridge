@@ -1,5 +1,6 @@
 // server.js — Twilio <-> ElevenLabs bridge
 // No overrides + barge-in helpers + explicit user_audio_start/end + log throttling
+// Includes: RESET utterance when EL audio starts (prevents "stuck speaking" after intro)
 
 const http = require('http');
 const url = require('url');
@@ -36,7 +37,6 @@ server.on('upgrade', (req, socket, head) => {
   req.__query = query || {};
   wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
 });
-
 wss.on('connection', (twilioWs) => attachBridgeHandlers(twilioWs));
 
 // Lifecycle
@@ -140,6 +140,10 @@ function attachBridgeHandlers(twilioWs) {
             elSpoke = true; elHasSpoken = true;
             clearTimeout(nudge1); clearTimeout(nudge2);
 
+            // >>> RESET for agent turn: ensure user's next words start a NEW utterance
+            resetUtterance();
+            console.log('[VAD] reset_for_agent_turn');
+
             const bytes = Buffer.from(audioB64, 'base64').length;
             if (LOG_FRAMES_EVERY !== 0) console.log('[EL->TWILIO] audio chunk', { len: bytes, format: elOutFormat });
 
@@ -169,25 +173,25 @@ function attachBridgeHandlers(twilioWs) {
     if (event === 'media') {
       const muLawB64 = msg?.media?.payload; if (!muLawB64) return;
 
-      // Start-of-utterance: first caller frame
+      // Start-of-utterance: first caller frame (per turn)
       if (!speaking) {
         speaking = true;
         console.log('[VAD] user_started_speaking');
 
-        // Some agents require explicit "start"
+        // Explicit "start"
         if (!sentUserAudioStartForThisUtterance && elWs && elWs.readyState === WebSocket.OPEN) {
           try { elWs.send(JSON.stringify({ type: "user_audio_start" })); console.log('[VAD] user_audio_start sent'); } catch {}
           sentUserAudioStartForThisUtterance = true;
         }
 
-        // If agent has spoken and we haven't hinted yet, send user_activity (barge-in)
+        // If agent has spoken, hint barge-in
         if (elHasSpoken && !callerActiveNotified && elWs && elWs.readyState === WebSocket.OPEN) {
           try { elWs.send(JSON.stringify({ type: "user_activity" })); console.log('[EL] user_activity sent (caller started talking)'); } catch {}
           callerActiveNotified = true;
         }
       }
 
-      // Rearm silence timer to close utterance when user stops
+      // Rearm silence timer to close utterance after pause
       clearTimeout(silenceTimer);
       silenceTimer = setTimeout(() => {
         if (speaking && elWs && elWs.readyState === WebSocket.OPEN) {
