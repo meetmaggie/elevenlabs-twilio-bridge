@@ -1,5 +1,5 @@
 // server.js – MeetMaggie Twilio <-> ElevenLabs bridge
-// Enhanced version with proper audio forwarding and debugging
+// Enhanced version with comprehensive debugging and proper audio forwarding
 // Env variables to set in Railway:
 //   ELEVENLABS_API_KEY (required)
 //   ELEVENLABS_DISCOVERY_AGENT_ID (required)
@@ -7,7 +7,7 @@
 //   BRIDGE_AUTH_TOKEN (optional)
 //   NODE_ENV=production (recommended)
 //   SILENCE_MS=800  EL_BUFFER_MS=200  UTTER_MAX_MS=3000  (tunable)
-//   LOG_FRAMES_EVERY=20  LOG_MARK_ACKS=1  (debugging)
+//   LOG_FRAMES_EVERY=20  LOG_MARK_ACKS=0  (debugging)
 
 const http = require('http');
 const url = require('url');
@@ -22,17 +22,18 @@ const LOOPBACK_ONLY = (process.env.LOOPBACK_ONLY || '').trim() === '1';
 
 // Tunable parameters
 const LOG_FRAMES_EVERY = parseInt(process.env.LOG_FRAMES_EVERY || '20', 10);
-const LOG_MARK_ACKS = (process.env.LOG_MARK_ACKS || '1').trim() === '1';
+const LOG_MARK_ACKS = (process.env.LOG_MARK_ACKS || '0').trim() === '1';
 const SILENCE_MS = parseInt(process.env.SILENCE_MS || '800', 10);
 const EL_BUFFER_MS = parseInt(process.env.EL_BUFFER_MS || '200', 10);
 const UTTER_MAX_MS = parseInt(process.env.UTTER_MAX_MS || '3000', 10);
 const FRAMES_PER_PACKET = Math.max(1, Math.round(EL_BUFFER_MS / 20));
 
-console.log(`[STARTUP] MeetMaggie Bridge starting...`);
+console.log(`[STARTUP] MeetMaggie Voice Bridge v2.1 starting...`);
 console.log(`[CONFIG] SILENCE_MS=${SILENCE_MS}, EL_BUFFER_MS=${EL_BUFFER_MS}, UTTER_MAX_MS=${UTTER_MAX_MS}`);
 console.log(`[CONFIG] FRAMES_PER_PACKET=${FRAMES_PER_PACKET}, LOOPBACK_ONLY=${LOOPBACK_ONLY}`);
+console.log(`[CONFIG] Enhanced debugging enabled with comprehensive logging`);
 
-// HTTP server
+// HTTP server with enhanced health endpoints
 const server = http.createServer((req, res) => {
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
@@ -49,14 +50,15 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ 
       status: 'healthy', 
-      service: 'MeetMaggie Voice Bridge',
-      timestamp: new Date().toISOString()
+      service: 'MeetMaggie Voice Bridge v2.1',
+      timestamp: new Date().toISOString(),
+      activeConnections: wss ? wss.clients.size : 0
     }));
   }
 
   if (req.url === '/' || req.url === '/status') {
     res.writeHead(200, { ...corsHeaders, 'Content-Type': 'text/plain' });
-    return res.end('MeetMaggie Voice Bridge: Ready for calls');
+    return res.end('MeetMaggie Voice Bridge v2.1: Ready for calls with enhanced debugging');
   }
 
   res.writeHead(404, { ...corsHeaders, 'Content-Type': 'text/plain' });
@@ -68,6 +70,8 @@ const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
+  
+  console.log(`[WS] Upgrade request: ${pathname}`);
   
   if (pathname !== '/ws' && pathname !== '/media-stream') {
     console.warn('[WS] Invalid path attempted:', pathname);
@@ -91,7 +95,7 @@ wss.on('connection', (twilioWs, req) => {
   attachBridgeHandlers(twilioWs, req.__query || {});
 });
 
-// Health monitoring
+// Enhanced health monitoring
 setInterval(() => {
   const activeConnections = wss.clients.size;
   console.log(`[HEARTBEAT] MeetMaggie alive - Active connections: ${activeConnections}`, new Date().toISOString());
@@ -111,8 +115,9 @@ process.on('SIGTERM', () => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[STARTUP] MeetMaggie Voice Bridge listening on port ${PORT}`);
+  console.log(`[STARTUP] MeetMaggie Voice Bridge v2.1 listening on port ${PORT}`);
   console.log(`[STARTUP] WebSocket endpoint: /ws or /media-stream`);
+  console.log(`[STARTUP] Ready to bridge Twilio calls to ElevenLabs!`);
 });
 
 // ================== Core Bridge Logic ==================
@@ -145,6 +150,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
   let firstUserInput = true;
   let elHasSpoken = false;
   let userHasSpoken = false;
+  let lastAgentAudioTime = 0;
 
   // Nudge timers
   let nudge1 = null, nudge2 = null, nudge3 = null;
@@ -251,7 +257,8 @@ function attachBridgeHandlers(twilioWs, query = {}) {
       reason: reason?.toString(),
       durationMs: duration,
       totalAudioReceived,
-      totalFramesSent
+      totalFramesSent,
+      userHasSpoken
     });
     cleanup();
   });
@@ -271,6 +278,15 @@ function attachBridgeHandlers(twilioWs, query = {}) {
     }
 
     const event = msg?.event;
+    
+    // DEBUG: Log ALL events from Twilio (except marks to reduce noise)
+    if (event !== 'mark') {
+      log('TWILIO_RAW', `Event received: ${event}`, { 
+        hasPayload: !!(msg?.media?.payload),
+        streamSid: msg?.streamSid || msg?.start?.streamSid,
+        payloadLength: msg?.media?.payload?.length || 0
+      });
+    }
 
     if (event === 'connected') {
       log('TWILIO', 'Connected event received');
@@ -298,6 +314,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
       elBuffer = []; elBufferedFrames = 0; totalFramesSent = 0; totalAudioReceived = 0;
       elOpen = false; elReady = false; elHasSpoken = false; userHasSpoken = false;
       conversationStarted = false; firstUserInput = true;
+      lastAgentAudioTime = 0;
       resetUtterance();
 
       if (LOOPBACK_ONLY) {
@@ -322,17 +339,42 @@ function attachBridgeHandlers(twilioWs, query = {}) {
 
     if (event === 'media') {
       const muLawB64 = msg?.media?.payload;
-      if (!muLawB64) return;
+      if (!muLawB64) {
+        log('ERROR', 'Media event missing payload');
+        return;
+      }
 
       totalAudioReceived++;
 
-      // Voice Activity Detection
-      if (!speaking) {
+      // DEBUG: Log first 20 media frames in detail
+      if (totalAudioReceived <= 20) {
+        log('MEDIA_DEBUG', `Frame ${totalAudioReceived} received`, { 
+          payloadLength: muLawB64.length,
+          speaking: speaking,
+          elReady: elReady,
+          lastAgentTime: lastAgentAudioTime,
+          currentTime: Date.now(),
+          timeSinceAgent: Date.now() - (lastAgentAudioTime || 0)
+        });
+      }
+
+      // Enhanced Voice Activity Detection
+      const currentTime = Date.now();
+      const timeSinceLastAgent = currentTime - (lastAgentAudioTime || 0);
+      
+      // Trigger user speech detection if:
+      // 1. Not currently speaking AND
+      // 2. Either enough time passed since agent spoke (500ms) OR agent hasn't spoken yet
+      if (!speaking && (timeSinceLastAgent > 500 || !elHasSpoken)) {
         speaking = true;
         userHasSpoken = true;
-        log('VAD', 'User started speaking');
+        log('VAD', 'User started speaking', { 
+          totalFrames: totalAudioReceived,
+          timeSinceAgent: timeSinceLastAgent,
+          elHasSpoken: elHasSpoken
+        });
 
-        // Send user audio start signal
+        // Send user audio start signal to ElevenLabs
         if (elWs && elOpen) {
           try {
             elWs.send(JSON.stringify({ type: "user_audio_start" }));
@@ -342,7 +384,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
           }
         }
 
-        // Set hard cap timer
+        // Set hard cap timer to prevent infinite user turns
         clearTimeout(utterCapTimer);
         utterCapTimer = setTimeout(() => {
           log('VAD', 'Hard cap reached - ending user turn');
@@ -350,11 +392,21 @@ function attachBridgeHandlers(twilioWs, query = {}) {
         }, UTTER_MAX_MS);
       }
 
-      // Buffer the audio
+      // Always buffer the audio regardless of VAD state
       try {
         const audioBytes = Buffer.from(muLawB64, 'base64');
         elBuffer.push(audioBytes);
         elBufferedFrames += 1;
+
+        // Log first few audio packets for debugging
+        if (totalAudioReceived <= 10) {
+          log('AUDIO', `Buffered frame ${totalAudioReceived}`, { 
+            bytes: audioBytes.length,
+            speaking: speaking,
+            elReady: elReady,
+            bufferFrames: elBufferedFrames
+          });
+        }
 
         // Immediate flush if we have enough frames
         if (elBufferedFrames >= FRAMES_PER_PACKET && elOpen && elReady) {
@@ -364,17 +416,19 @@ function attachBridgeHandlers(twilioWs, query = {}) {
         log('ERROR', 'Failed to buffer audio', { error: e.message });
       }
 
-      // Loopback mode (for testing)
+      // Loopback mode for testing
       if (LOOPBACK_ONLY) {
         sendAudioToTwilio(muLawB64);
       }
 
-      // Reset silence timer
-      clearTimeout(silenceTimer);
-      silenceTimer = setTimeout(() => {
-        log('VAD', 'Silence detected - ending user turn');
-        endUserTurn('silence');
-      }, SILENCE_MS);
+      // Reset silence timer only if we're in a speaking state
+      if (speaking) {
+        clearTimeout(silenceTimer);
+        silenceTimer = setTimeout(() => {
+          log('VAD', 'Silence detected - ending user turn');
+          endUserTurn('silence');
+        }, SILENCE_MS);
+      }
 
       return;
     }
@@ -416,7 +470,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
     log('TWILIO', 'Unhandled event', { event });
   });
 
-  // Helper function to end user turns
+  // Helper function to end user turns properly
   function endUserTurn(reason) {
     log('VAD', `Ending user turn: ${reason}`);
 
@@ -432,7 +486,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
         log('ERROR', 'Failed to send user_audio_end', { error: e.message });
       }
 
-      // Double end signal after delay
+      // Double end signal after delay (EL sometimes needs this)
       setTimeout(() => {
         if (elWs && elOpen) {
           try {
@@ -512,7 +566,9 @@ function attachBridgeHandlers(twilioWs, query = {}) {
       const endpoint = endpoints[endpointIndex];
       const endpointName = endpointIndex === 0 ? '/ws' : '/conversation';
       
-      log('EL_CONNECT', `Connecting to ElevenLabs ${endpointName}`, { agentId: agentId.substring(0, 8) + '...' });
+      log('EL_CONNECT', `Connecting to ElevenLabs ${endpointName}`, { 
+        agentId: agentId.substring(0, 8) + '...' 
+      });
 
       elWs = new WebSocket(endpoint, { headers });
 
@@ -554,7 +610,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
           log('ERROR', 'Failed to send initialization', { error: e.message });
         }
 
-        // Progressive nudging strategy
+        // Progressive nudging strategy to ensure agent starts talking
         nudge1 = setTimeout(() => {
           if (!elHasSpoken && elWs && elOpen) {
             try {
@@ -604,7 +660,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
           return;
         }
 
-        // Handle metadata
+        // Handle metadata (format configuration)
         if (message?.type === 'conversation_initiation_metadata') {
           const metadata = message.conversation_initiation_metadata_event || {};
           elInFormat = metadata.user_input_audio_format;
@@ -617,7 +673,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
             agentFormat: elOutFormat
           });
 
-          // Flush any buffered audio
+          // Flush any buffered audio now that we're ready
           if (elBufferedFrames > 0) {
             log('EL_SEND', 'Flushing buffered audio after metadata');
             flushElBuffer('metadata_ready');
@@ -625,7 +681,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
           return;
         }
 
-        // Handle audio responses
+        // Handle audio responses from agent
         if (message?.type === 'audio' && message.audio_event?.audio_base_64) {
           if (!elHasSpoken) {
             elHasSpoken = true;
@@ -635,7 +691,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
             clearTimeout(nudge3);
           }
 
-          // Track when agent finishes speaking for VAD
+          // Track when agent finishes speaking for VAD timing
           lastAgentAudioTime = Date.now();
           resetUtterance();
           
@@ -644,16 +700,16 @@ function attachBridgeHandlers(twilioWs, query = {}) {
           
           log('EL_RECV', 'Audio chunk received', { bytes: audioBytes, format: elOutFormat });
 
-          // Process audio based on format
+          // Process audio based on format and send to Twilio
           if (elOutFormat === 'ulaw_8000') {
-            // Direct µ-law - send in 20ms chunks
+            // Direct µ-law - send in 20ms chunks (160 bytes each)
             const ulawBuffer = Buffer.from(audioB64, 'base64');
             for (let offset = 0; offset < ulawBuffer.length; offset += 160) {
               const slice = ulawBuffer.subarray(offset, Math.min(offset + 160, ulawBuffer.length));
               sendAudioToTwilio(slice.toString('base64'));
             }
           } else {
-            // Assume PCM16 and convert to µ-law
+            // Assume PCM16 and convert to µ-law for Twilio
             const pcm16Buffer = Buffer.from(audioB64, 'base64');
             let processedBuffer = pcm16Buffer;
             
@@ -665,7 +721,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
             // Convert to µ-law
             const muLawBuffer = pcm16ToMuLaw(processedBuffer);
             
-            // Send in 20ms chunks (160 bytes)
+            // Send in 20ms chunks (160 bytes each)
             for (let offset = 0; offset < muLawBuffer.length; offset += 160) {
               const slice = muLawBuffer.subarray(offset, Math.min(offset + 160, muLawBuffer.length));
               sendAudioToTwilio(slice.toString('base64'));
@@ -674,12 +730,12 @@ function attachBridgeHandlers(twilioWs, query = {}) {
           return;
         }
 
-        // Handle transcripts
+        // Handle user transcripts
         if (message?.type === 'user_transcript') {
           const transcript = message.user_transcription_event?.user_transcript;
           log('EL_RECV', 'User transcript received', { transcript });
 
-          // If we get transcripts but no audio responses, nudge the agent
+          // If we get transcripts but no audio responses after delay, nudge
           if (transcript && transcript.length > 5) {
             setTimeout(() => {
               if (!elHasSpoken && elWs && elOpen) {
@@ -701,14 +757,14 @@ function attachBridgeHandlers(twilioWs, query = {}) {
           const response = message.agent_response_event?.agent_response;
           log('EL_RECV', 'Agent text response', { response });
 
-          // If we get text but no audio, there might be a voice configuration issue
+          // If we get text but no audio, might be voice configuration issue
           if (response && !elHasSpoken) {
             log('WARNING', 'Got text response but no audio - check agent voice settings');
           }
           return;
         }
 
-        // Handle ping/pong
+        // Handle ping/pong keepalive
         if (message?.type === 'ping') {
           const eventId = message.ping_event?.event_id;
           try {
@@ -723,7 +779,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
           return;
         }
 
-        // Log unhandled events
+        // Log unhandled message types
         log('EL_RECV', 'Unhandled message type', {
           type: message?.type,
           keys: Object.keys(message || {})
@@ -736,7 +792,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
         const reasonStr = reason?.toString() || 'No reason';
         log('EL_CONNECT', 'Connection closed', { code, reason: reasonStr });
 
-        // Retry on unexpected closure
+        // Retry on unexpected closure with first endpoint
         if (endpointIndex === 0 && code !== 1000) {
           endpointIndex = 1;
           log('EL_CONNECT', 'Retrying with /conversation endpoint');
