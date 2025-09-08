@@ -1,7 +1,20 @@
-// server.js — Twilio <-> ElevenLabs bridge
-// Fix: send audio with { type:"audio", audio_event:{ audio_base_64 } } schema
-// Keeps: no overrides, ws->conversation fallback, barge-in hint, explicit start/end,
-//        log throttling, and "reset utterance on first EL audio".
+// server.js — Twilio <-> ElevenLabs bridge (BUFFERED upload to EL)
+// Key changes:
+//  - Buffer inbound 20ms μ-law frames into ~200ms packets before sending to EL
+//  - Flush any remainder on user_audio_end
+//  - Still sends user_audio_start / user_audio_end and user_activity
+//
+// Env (Railway -> Variables):
+//   ELEVENLABS_API_KEY                 (required)
+//   ELEVENLABS_DISCOVERY_AGENT_ID      (required if not passed by Twilio)
+//   ELEVENLABS_DAILY_AGENT_ID          (optional)
+//   BRIDGE_AUTH_TOKEN                  (optional)
+//   NODE_ENV=production                (recommended)
+//   LOOPBACK_ONLY=0                    (set 1 for echo test)
+//   LOG_FRAMES_EVERY=100               (0=off)
+//   LOG_MARK_ACKS=0
+//   SILENCE_MS=700                     (utterance end after silence)
+//   EL_BUFFER_MS=200                   (size of buffered packet to EL; default 200ms)
 
 const http = require('http');
 const url = require('url');
@@ -13,14 +26,12 @@ const BRIDGE_AUTH_TOKEN = process.env.BRIDGE_AUTH_TOKEN || null;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || null;
 const DISCOVERY_ID = process.env.ELEVENLABS_DISCOVERY_AGENT_ID || null;
 const DAILY_ID = process.env.ELEVENLABS_DAILY_AGENT_ID || null;
+
 const LOOPBACK_ONLY = (process.env.LOOPBACK_ONLY || '').trim() === '1';
-
-// Logging controls
-const LOG_FRAMES_EVERY = parseInt(process.env.LOG_FRAMES_EVERY || '100', 10); // 0 = disable
+const LOG_FRAMES_EVERY = parseInt(process.env.LOG_FRAMES_EVERY || '100', 10);
 const LOG_MARK_ACKS = (process.env.LOG_MARK_ACKS || '0').trim() === '1';
-
-// Silence (ms) before we send user_audio_end
 const SILENCE_MS = parseInt(process.env.SILENCE_MS || '700', 10);
+const EL_BUFFER_MS = parseInt(process.env.EL_BUFFER_MS || '200', 10); // 10 frames @ 20ms
 
 // ---------------- HTTP (health) ----------------
 const server = http.createServer((req, res) => {
@@ -57,24 +68,42 @@ function attachBridgeHandlers(twilioWs) {
   // Outbound to Twilio
   let seq = 0, chunk = 0, tsMs = 0;
 
-  // Buffer caller frames until EL metadata arrives
-  const bufferedCaller = [];
+  // Buffered uploader to EL (collect 200ms of μ-law)
+  const FRAMES_PER_PACKET = Math.max(1, Math.round(EL_BUFFER_MS / 20)); // default 10
+  let elBuffer = [];     // Array<Buffer> of μ-law bytes
+  let elBufferedFrames = 0;
 
   // Nudges / barge-in helpers
   let nudge1 = null, nudge2 = null, elSpoke = false;
-  let elHasSpoken = false;           // agent produced audio at least once
+  let elHasSpoken = false; // agent produced audio at least once
 
-  // Utterance state (explicit starts/ends)
-  let speaking = false;              // caller currently speaking
+  // Utterance state
+  let speaking = false;
   let silenceTimer = null;
   let sentUserAudioStartForThisUtterance = false;
-  let callerActiveNotified = false;  // user_activity once per agent turn
+  let callerActiveNotified = false;
 
   const resetUtterance = () => {
     speaking = false;
     sentUserAudioStartForThisUtterance = false;
     callerActiveNotified = false;
     clearTimeout(silenceTimer);
+  };
+
+  // Flush buffered audio to EL (as a single structured message)
+  const flushElBuffer = () => {
+    if (!elBufferedFrames || !elWs || elWs.readyState !== WebSocket.OPEN) return;
+    const merged = Buffer.concat(elBuffer);
+    const b64 = merged.toString('base64');
+    try {
+      elWs.send(JSON.stringify({ type: "audio", audio_event: { audio_base_64: b64 } }));
+      // debug (throttled size only)
+      console.log('[EL<-USER] sent packet', { ms: elBufferedFrames * 20, bytes: merged.length });
+    } catch (e) {
+      console.warn('[EL<-USER] send packet failed', e?.message || e);
+    }
+    elBuffer = [];
+    elBufferedFrames = 0;
   };
 
   twilioWs.on('message', (buf) => {
@@ -93,10 +122,11 @@ function attachBridgeHandlers(twilioWs) {
       phone   = cp.caller_phone || '';
       persist = cp.persist === '1' ? '1' : '0';
 
-      console.log('[TWILIO] start', { streamSid: twilioStreamSid, agentId, phone, LOOPBACK_ONLY });
+      console.log('[TWILIO] start', { streamSid: twilioStreamSid, agentId, phone, LOOPBACK_ONLY, FRAMES_PER_PACKET });
 
       // reset per-call
       seq = 0; chunk = 0; tsMs = 0;
+      elBuffer = []; elBufferedFrames = 0;
       elHasSpoken = false; elSpoke = false;
       resetUtterance();
       clearTimeout(nudge1); clearTimeout(nudge2);
@@ -108,7 +138,7 @@ function attachBridgeHandlers(twilioWs) {
         elWs = connectToELWithFallback({
           agentId, phone,
           onOpen: (ws) => {
-            // Init WITHOUT overrides (agent config rules)
+            // Init WITHOUT overrides
             const init = {
               type: "conversation_initiation_client_data",
               dynamic_variables: { caller_phone: phone || "" }
@@ -116,32 +146,20 @@ function attachBridgeHandlers(twilioWs) {
             try { ws.send(JSON.stringify(init)); console.log('[EL] sent init (no overrides)'); }
             catch (e) { console.error('[EL] failed to send init', e?.message || e); }
 
-            // Gentle nudges only if EL stays silent; cancel once EL speaks
-            nudge1 = setTimeout(() => {
-              if (!elSpoke) { try { ws.send(JSON.stringify({ type:"user_message", text:"Hello" })); } catch {} console.warn('[EL] first nudge sent'); }
-            }, 1200);
-            nudge2 = setTimeout(() => {
-              if (!elSpoke) { try { ws.send(JSON.stringify({ type:"user_message", text:"Are you there?" })); } catch {} console.warn('[EL] second nudge sent'); }
-            }, 2500);
+            // Gentle nudges; auto-cancel when EL speaks
+            nudge1 = setTimeout(() => { if (!elSpoke) { try { ws.send(JSON.stringify({ type:"user_message", text:"Hello" })); } catch {} console.warn('[EL] first nudge sent'); }}, 1200);
+            nudge2 = setTimeout(() => { if (!elSpoke) { try { ws.send(JSON.stringify({ type:"user_message", text:"Are you there?" })); } catch {} console.warn('[EL] second nudge sent'); }}, 2500);
           },
           onMetadata: ({ user_input_audio_format, agent_output_audio_format }) => {
             elInFormat  = user_input_audio_format;
             elOutFormat = agent_output_audio_format;
             elReady = true;
-            console.log('[EL] formats', { elInFormat, elOutFormat });
-
-            if (bufferedCaller.length) {
-              console.log(`[EL] flushing ${bufferedCaller.length} buffered chunks`);
-              for (const b64 of bufferedCaller) sendUserChunkToEL(elWs, elInFormat, b64);
-              bufferedCaller.length = 0;
-            }
+            console.log('[EL] formats', { elInFormat, elOutFormat, bufferedMs: FRAMES_PER_PACKET * 20 });
           },
           onAudioFromEL: (audioB64) => {
-            // EL started talking: stop nudges, enable barge-in
+            // EL is speaking — reset user turn & cancel nudges
             elSpoke = true; elHasSpoken = true;
             clearTimeout(nudge1); clearTimeout(nudge2);
-
-            // RESET for agent turn (prevents us from thinking user is already speaking)
             resetUtterance();
             console.log('[VAD] reset_for_agent_turn');
 
@@ -174,47 +192,59 @@ function attachBridgeHandlers(twilioWs) {
     if (event === 'media') {
       const muLawB64 = msg?.media?.payload; if (!muLawB64) return;
 
-      // Start-of-utterance: first caller frame (per turn)
+      // Start-of-utterance
       if (!speaking) {
         speaking = true;
         console.log('[VAD] user_started_speaking');
 
-        // Explicit "start"
         if (!sentUserAudioStartForThisUtterance && elWs && elWs.readyState === WebSocket.OPEN) {
           try { elWs.send(JSON.stringify({ type: "user_audio_start" })); console.log('[VAD] user_audio_start sent'); } catch {}
           sentUserAudioStartForThisUtterance = true;
         }
 
-        // If agent has spoken, hint barge-in
+        // Barge-in hint if EL has spoken
         if (elHasSpoken && !callerActiveNotified && elWs && elWs.readyState === WebSocket.OPEN) {
           try { elWs.send(JSON.stringify({ type: "user_activity" })); console.log('[EL] user_activity sent (caller started talking)'); } catch {}
           callerActiveNotified = true;
         }
       }
 
-      // Rearm silence timer to close utterance after pause
+      // Buffer 20ms μ-law frames into a 200ms packet for EL
+      if (!LOOPBACK_ONLY && elWs && elWs.readyState === WebSocket.OPEN) {
+        // store raw bytes (μ-law)
+        try {
+          const bytes = Buffer.from(muLawB64, 'base64');
+          elBuffer.push(bytes);
+          elBufferedFrames += 1;
+
+          if (elBufferedFrames >= FRAMES_PER_PACKET) {
+            flushElBuffer();
+          }
+        } catch (e) {
+          console.warn('[BUF] push failed', e?.message || e);
+        }
+      }
+
+      // loopback (echo) path for quick testing
+      if (LOOPBACK_ONLY) {
+        sendOutboundFrame(twilioWs, twilioStreamSid, muLawB64, ++seq, ++chunk, tsMs);
+        tsMs += 20;
+      }
+
+      // re-arm silence timer to close utterance after pause
       clearTimeout(silenceTimer);
       silenceTimer = setTimeout(() => {
-        if (speaking && elWs && elWs.readyState === WebSocket.OPEN) {
-          try { elWs.send(JSON.stringify({ type: "user_audio_end" })); console.log('[VAD] user_audio_end sent (silence)'); } catch {}
+        if (speaking) {
+          // final flush of any remainder BEFORE sending end
+          flushElBuffer();
+
+          if (elWs && elWs.readyState === WebSocket.OPEN) {
+            try { elWs.send(JSON.stringify({ type: "user_audio_end" })); console.log('[VAD] user_audio_end sent (silence)'); } catch {}
+          }
           resetUtterance();
         }
       }, SILENCE_MS);
 
-      if (LOOPBACK_ONLY) {
-        sendOutboundFrame(twilioWs, twilioStreamSid, muLawB64, ++seq, ++chunk, tsMs);
-        tsMs += 20;
-        return;
-      }
-
-      if (elWs && elWs.readyState === WebSocket.OPEN) {
-        if (elReady) {
-          // >>>>> THE IMPORTANT CHANGE: send audio with structured schema
-          sendUserChunkToEL(elWs, elInFormat, muLawB64);
-        } else {
-          bufferedCaller.push(muLawB64);
-        }
-      }
       return;
     }
 
@@ -223,6 +253,8 @@ function attachBridgeHandlers(twilioWs) {
     if (event === 'stop') {
       clearTimeout(silenceTimer);
       clearTimeout(nudge1); clearTimeout(nudge2);
+      // Flush any leftover audio just in case
+      flushElBuffer();
       try { twilioWs.close(1000); } catch {}
       try { elWs && elWs.close(1000); } catch {}
       return;
@@ -244,30 +276,6 @@ function sendOutboundFrame(twilioWs, streamSid, payloadB64, seq, chunk, tsMs) {
   }
 }
 
-// -------------- Forward caller audio to EL in correct format --------------
-function sendUserChunkToEL(elWs, elInFormat, muLawB64) {
-  // If EL expects ulaw_8000 (your metadata shows that), we can forward as-is in the new schema.
-  if (elInFormat === 'ulaw_8000') {
-    // Newer schema (most reliable): type: "audio"
-    elWs.send(JSON.stringify({
-      type: "audio",
-      audio_event: { audio_base_64: muLawB64 }
-    }));
-    return;
-  }
-
-  // Otherwise convert to 16k PCM and send with the same schema
-  const muLawBuf  = Buffer.from(muLawB64, 'base64');
-  const pcm16_8k  = muLawToPcm16(muLawBuf);
-  const pcm16_16k = upsamplePcm16Mono8kTo16k(pcm16_8k);
-  const b64_16k   = Buffer.from(pcm16_16k.buffer, pcm16_16k.byteOffset, pcm16_16k.byteLength).toString('base64');
-
-  elWs.send(JSON.stringify({
-    type: "audio",
-    audio_event: { audio_base_64: b64_16k }
-  }));
-}
-
 // -------------- Robust EL connect with fallback; no overrides --------------
 function connectToELWithFallback({ agentId, phone, onOpen, onMetadata, onAudioFromEL }) {
   const endpoints = [
@@ -284,7 +292,6 @@ function connectToELWithFallback({ agentId, phone, onOpen, onMetadata, onAudioFr
 
     elWs = new WebSocket(ep, { headers });
 
-    // Attach error FIRST so 403 never crashes
     elWs.on('error', (err) => {
       const msg = err?.message || String(err);
       console.error('[EL] error', msg);
@@ -338,6 +345,9 @@ function connectToELWithFallback({ agentId, phone, onOpen, onMetadata, onAudioFr
 }
 
 // ================== Audio helpers ==================
+// Convert 16k PCM -> μ-law and reverse as needed.
+// NOTE: EL metadata says user_input_audio_format: 'ulaw_8000' so we normally send μ-law unchanged.
+
 function muLawToPcm16(muBuf) {
   const out = new Int16Array(muBuf.length);
   for (let i = 0; i < muBuf.length; i++) {
@@ -373,4 +383,3 @@ function downsamplePcm16Mono16kTo8k(pcm16kBuf) {
   for (let i = 0, j = 0; j < out.length; i += 2, j++) out[j] = in16[i];
   return out;
 }
-
