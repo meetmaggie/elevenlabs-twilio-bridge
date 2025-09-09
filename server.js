@@ -1,13 +1,33 @@
-// server.js – MeetMaggie Twilio <-> ElevenLabs bridge
-// Enhanced version with comprehensive debugging and proper audio forwarding
-// Env variables to set in Railway:
+// server.js – MeetMaggie Twilio <-> ElevenLabs bridge (v2.2)
+// - Uses signed URL first, falls back to /convai/twilio
+// - Sends caller mic as { user_audio_chunk: "<base64 μ-law 8k 20ms>" }
+// - Forwards ONLY inbound audio from Twilio
+// - Handles exact-id pong + barge-in clear
+// - Supports discovery/daily agents via customParameters
+//
+// Env (Railway):
 //   ELEVENLABS_API_KEY (required)
 //   ELEVENLABS_DISCOVERY_AGENT_ID (required)
 //   ELEVENLABS_DAILY_AGENT_ID (optional)
-//   BRIDGE_AUTH_TOKEN (optional)
+//   BRIDGE_AUTH_TOKEN (optional)  // recommended
 //   NODE_ENV=production (recommended)
-//   SILENCE_MS=800  EL_BUFFER_MS=200  UTTER_MAX_MS=3000  (tunable)
-//   LOG_FRAMES_EVERY=20  LOG_MARK_ACKS=0  (debugging)
+//   LOOPBACK_ONLY=0|1 (optional)
+//   SILENCE_MS=800 EL_BUFFER_MS=200 UTTER_MAX_MS=3000 (optional tuning)
+//   LOG_FRAMES_EVERY=20 LOG_MARK_ACKS=0 DEBUG_AUDIO=0 (optional)
+//
+// TwiML example:
+/*
+<Response>
+  <Connect>
+    <Stream url="wss://<your-railway-domain>/ws">
+      <Parameter name="token" value="YOUR_BRIDGE_AUTH_TOKEN"/>
+      <Parameter name="mode" value="discovery"/> <!-- or "daily" -->
+      <Parameter name="agent_id" value="agent_XXXXXXXXXXXX"/> <!-- optional -->
+      <Parameter name="caller_phone" value="+441234567890"/>
+    </Stream>
+  </Connect>
+</Response>
+*/
 
 const http = require('http');
 const url = require('url');
@@ -20,7 +40,7 @@ const DISCOVERY_ID = process.env.ELEVENLABS_DISCOVERY_AGENT_ID || null;
 const DAILY_ID = process.env.ELEVENLABS_DAILY_AGENT_ID || null;
 const LOOPBACK_ONLY = (process.env.LOOPBACK_ONLY || '').trim() === '1';
 
-// Tunable parameters
+// Tunables
 const LOG_FRAMES_EVERY = parseInt(process.env.LOG_FRAMES_EVERY || '20', 10);
 const LOG_MARK_ACKS = (process.env.LOG_MARK_ACKS || '0').trim() === '1';
 const SILENCE_MS = parseInt(process.env.SILENCE_MS || '800', 10);
@@ -28,122 +48,97 @@ const EL_BUFFER_MS = parseInt(process.env.EL_BUFFER_MS || '200', 10);
 const UTTER_MAX_MS = parseInt(process.env.UTTER_MAX_MS || '3000', 10);
 const FRAMES_PER_PACKET = Math.max(1, Math.round(EL_BUFFER_MS / 20));
 
-console.log(`[STARTUP] MeetMaggie Voice Bridge v2.1 starting...`);
+console.log(`[STARTUP] MeetMaggie Voice Bridge v2.2 starting...`);
 console.log(`[CONFIG] SILENCE_MS=${SILENCE_MS}, EL_BUFFER_MS=${EL_BUFFER_MS}, UTTER_MAX_MS=${UTTER_MAX_MS}`);
 console.log(`[CONFIG] FRAMES_PER_PACKET=${FRAMES_PER_PACKET}, LOOPBACK_ONLY=${LOOPBACK_ONLY}`);
-console.log(`[CONFIG] Enhanced debugging enabled with comprehensive logging`);
 
-// HTTP server with enhanced health endpoints
 const server = http.createServer((req, res) => {
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type'
   };
-
   if (req.method === 'OPTIONS') {
-    res.writeHead(200, corsHeaders);
-    return res.end();
+    res.writeHead(200, corsHeaders); return res.end();
   }
-
   if (req.url === '/health') {
     res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ 
-      status: 'healthy', 
-      service: 'MeetMaggie Voice Bridge v2.1',
+    return res.end(JSON.stringify({
+      status: 'healthy',
+      service: 'MeetMaggie Voice Bridge v2.2',
       timestamp: new Date().toISOString(),
       activeConnections: wss ? wss.clients.size : 0
     }));
   }
-
   if (req.url === '/' || req.url === '/status') {
     res.writeHead(200, { ...corsHeaders, 'Content-Type': 'text/plain' });
-    return res.end('MeetMaggie Voice Bridge v2.1: Ready for calls with enhanced debugging');
+    return res.end('MeetMaggie Voice Bridge v2.2: Ready for calls');
   }
-
   res.writeHead(404, { ...corsHeaders, 'Content-Type': 'text/plain' });
   res.end('Not found');
 });
 
-// WebSocket server for Twilio Media Streams
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
-  
   console.log(`[WS] Upgrade request: ${pathname}`);
-  
+
   if (pathname !== '/ws' && pathname !== '/media-stream') {
     console.warn('[WS] Invalid path attempted:', pathname);
     return socket.destroy();
   }
-
-  if (BRIDGE_AUTH_TOKEN && (!query || query.token !== BRIDGE_AUTH_TOKEN)) {
-    console.warn('[WS] Unauthorized connection attempt');
+  // Optional URL-level token (useful for quick tests; primary auth is via customParameters)
+  if (BRIDGE_AUTH_TOKEN && query && query.token && query.token !== BRIDGE_AUTH_TOKEN) {
+    console.warn('[WS] Rejected: bad token in URL query');
     return socket.destroy();
   }
-
   req.__query = query || {};
   wss.handleUpgrade(req, socket, head, ws => {
-    console.log('[WS] Connection upgraded successfully');
+    console.log('[WS] Connection upgraded');
     wss.emit('connection', ws, req);
   });
 });
 
 wss.on('connection', (twilioWs, req) => {
-  console.log('[WS] New Twilio connection established');
   attachBridgeHandlers(twilioWs, req.__query || {});
 });
 
-// Enhanced health monitoring
+// Health logging
 setInterval(() => {
-  const activeConnections = wss.clients.size;
-  console.log(`[HEARTBEAT] MeetMaggie alive - Active connections: ${activeConnections}`, new Date().toISOString());
+  console.log(`[HEARTBEAT] Active connections: ${wss.clients.size} @ ${new Date().toISOString()}`);
 }, 60_000);
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('[SHUTDOWN] Graceful shutdown initiated');
-  try {
-    server.close(() => {
-      console.log('[SHUTDOWN] HTTP server closed');
-      process.exit(0);
-    });
-  } catch {
-    process.exit(0);
-  }
+  console.log('[SHUTDOWN] Graceful shutdown'); 
+  try { server.close(() => process.exit(0)); } catch { process.exit(0); }
 });
 
 server.listen(PORT, () => {
-  console.log(`[STARTUP] MeetMaggie Voice Bridge v2.1 listening on port ${PORT}`);
-  console.log(`[STARTUP] WebSocket endpoint: /ws or /media-stream`);
-  console.log(`[STARTUP] Ready to bridge Twilio calls to ElevenLabs!`);
+  console.log(`[STARTUP] Listening on :${PORT}`);
+  console.log(`[STARTUP] WebSocket endpoint: /ws`);
 });
 
-// ================== Core Bridge Logic ==================
+// ================== Core Bridge ==================
 
 function attachBridgeHandlers(twilioWs, query = {}) {
   const sessionId = generateSessionId();
-  console.log(`[SESSION:${sessionId}] New bridge session started`);
-
-  // Session state
+  const startedAt = Date.now();
   let twilioStreamSid = null;
   let agentId = null, mode = 'discovery', phone = '';
-  let callStartTime = Date.now();
+  let authed = !BRIDGE_AUTH_TOKEN; // if no token configured, treat as authed
 
-  // ElevenLabs state
-  let elWs = null, elOpen = false, elReady = false;
-  let conversationStarted = false;
+  // EL state
+  let elWs = null, elOpen = false, elReady = false, conversationStarted = false;
   let elInFormat = null, elOutFormat = null;
 
-  // Audio state
+  // Audio/VAD state
   let seq = 0, chunk = 0, tsMs = 0;
   let elBuffer = [];
   let elBufferedFrames = 0;
   let totalFramesSent = 0;
   let totalAudioReceived = 0;
-
-  // Voice activity detection
   let speaking = false;
   let silenceTimer = null;
   let utterCapTimer = null;
@@ -152,12 +147,12 @@ function attachBridgeHandlers(twilioWs, query = {}) {
   let userHasSpoken = false;
   let lastAgentAudioTime = 0;
 
-  // Nudge timers
+  // Nudges
   let nudge1 = null, nudge2 = null, nudge3 = null;
 
-  const log = (category, message, data = {}) => {
-    const timestamp = Date.now() - callStartTime;
-    console.log(`[${category}:${sessionId}:${timestamp}ms] ${message}`, data);
+  const log = (cat, msg, data = {}) => {
+    const t = Date.now() - startedAt;
+    console.log(`[${cat}:${sessionId}:${t}ms] ${msg}`, data);
   };
 
   const resetUtterance = () => {
@@ -168,690 +163,444 @@ function attachBridgeHandlers(twilioWs, query = {}) {
 
   const flushElBuffer = (label = 'flush') => {
     if (!elBufferedFrames) return;
-
-    const merged = Buffer.concat(elBuffer);
+    const merged = Buffer.concat(elBuffer); // μ-law bytes, 20ms per 160B
     const durationMs = elBufferedFrames * 20;
 
-    if (!elOpen) {
-      log('BUF', `${label} skipped - EL socket not open`, { durationMs, bytes: merged.length });
-      return;
-    }
-
-    if (!elReady) {
-      log('BUF', `${label} deferred - EL not ready`, { durationMs, bytes: merged.length });
+    if (!elOpen || !elReady) {
+      log('BUF', `${label} deferred`, { durationMs, bytes: merged.length, elOpen, elReady });
       return;
     }
 
     try {
-      // Send µ-law audio as configured in your ElevenLabs agent
-      const audioMessage = {
-        type: "audio",
-        audio_event: {
-          audio_base_64: merged.toString('base64')
-        }
-      };
-
-      elWs.send(JSON.stringify(audioMessage));
+      // Send in 20ms frames as user_audio_chunk
+      for (let o = 0; o < merged.length; o += 160) {
+        const slice = merged.subarray(o, Math.min(o + 160, merged.length));
+        elWs.send(JSON.stringify({ user_audio_chunk: slice.toString('base64') }));
+      }
       totalFramesSent += elBufferedFrames;
+      log('EL_SEND', `Audio -> EL`, { label, durationMs, frames: elBufferedFrames, bytes: merged.length, totalFramesSent });
 
-      log('EL_SEND', `Audio packet sent to ElevenLabs`, {
-        label,
-        durationMs,
-        frames: elBufferedFrames,
-        bytes: merged.length,
-        totalFramesSent,
-        format: 'ulaw'
-      });
-
-      // Trigger conversation start after first substantial audio
       if (firstUserInput && conversationStarted && elBufferedFrames > 5) {
         setTimeout(() => {
           if (elWs && elOpen) {
-            try {
-              elWs.send(JSON.stringify({ type: "conversation_start" }));
-              log('EL_SEND', 'Conversation start signal sent');
-            } catch (e) {
-              log('ERROR', 'Failed to send conversation_start', { error: e.message });
-            }
+            try { elWs.send(JSON.stringify({ type: "conversation_start" })); } catch {}
+            log('EL_SEND', 'conversation_start nudged');
           }
         }, 100);
         firstUserInput = false;
       }
-
     } catch (e) {
-      log('ERROR', 'Failed to send audio to ElevenLabs', { error: e.message });
+      log('ERROR', 'Send to EL failed', { error: e.message });
     }
 
-    // Reset buffer
     elBuffer = [];
     elBufferedFrames = 0;
   };
 
-  // Periodic buffer flush
   const flushInterval = setInterval(() => {
-    if (elBufferedFrames >= FRAMES_PER_PACKET) {
+    if (elBufferedFrames >= Math.max(1, Math.round(EL_BUFFER_MS / 20))) {
       flushElBuffer('periodic');
     }
   }, 50);
 
-  // Cleanup function
   const cleanup = () => {
-    log('SESSION', 'Cleaning up session resources');
+    log('SESSION', 'Cleanup');
     clearInterval(flushInterval);
     clearTimeout(silenceTimer);
     clearTimeout(utterCapTimer);
     clearTimeout(nudge1);
     clearTimeout(nudge2);
     clearTimeout(nudge3);
-    
-    if (elWs) {
-      try { elWs.close(1000); } catch {}
-    }
+    if (elWs) { try { elWs.close(1000); } catch {} }
   };
 
-  // Twilio WebSocket handlers
   twilioWs.on('close', (code, reason) => {
-    const duration = Date.now() - callStartTime;
-    log('TWILIO', 'Connection closed', { 
-      code, 
-      reason: reason?.toString(),
-      durationMs: duration,
-      totalAudioReceived,
-      totalFramesSent,
-      userHasSpoken
-    });
+    const dur = Date.now() - startedAt;
+    log('TWILIO', 'Closed', { code, reason: reason?.toString(), durMs: dur, totalAudioReceived, totalFramesSent, userHasSpoken });
     cleanup();
   });
 
-  twilioWs.on('error', (err) => {
-    log('ERROR', 'Twilio WebSocket error', { error: err.message });
-    cleanup();
-  });
+  twilioWs.on('error', (err) => { log('ERROR', 'Twilio WS error', { error: err.message }); cleanup(); });
 
   twilioWs.on('message', (buf) => {
-    let msg;
-    try {
-      msg = JSON.parse(buf.toString());
-    } catch {
-      log('ERROR', 'Invalid JSON from Twilio');
-      return;
-    }
-
+    let msg; try { msg = JSON.parse(buf.toString()); } catch { log('ERROR','Invalid JSON from Twilio'); return; }
     const event = msg?.event;
-    
-    // DEBUG: Log ALL events from Twilio (except marks to reduce noise)
     if (event !== 'mark') {
-      log('TWILIO_RAW', `Event received: ${event}`, { 
+      log('TWILIO_RAW', `Event: ${event}`, {
         hasPayload: !!(msg?.media?.payload),
         streamSid: msg?.streamSid || msg?.start?.streamSid,
         payloadLength: msg?.media?.payload?.length || 0
       });
     }
 
-    if (event === 'connected') {
-      log('TWILIO', 'Connected event received');
-      return;
-    }
+    if (event === 'connected') return;
 
     if (event === 'start') {
       const start = msg.start || {};
       twilioStreamSid = msg.streamSid || start.streamSid || null;
-
       const cp = start.customParameters || {};
+      const token = cp.token;
       mode = (cp.mode || 'discovery').toLowerCase();
       agentId = cp.agent_id || (mode === 'daily' ? DAILY_ID : DISCOVERY_ID);
       phone = cp.caller_phone || start.from || cp.from || '';
 
+      if (BRIDGE_AUTH_TOKEN) {
+        if (token && token === BRIDGE_AUTH_TOKEN) { authed = true; }
+        else { log('ERROR', 'Bad/missing token in customParameters'); try { twilioWs.close(1008, 'bad-token'); } catch {} return; }
+      }
+
       log('TWILIO', 'Stream started', {
         streamSid: twilioStreamSid,
-        agentId: agentId ? agentId.substring(0, 8) + '...' : 'missing',
-        phone,
-        mode
+        agentId: agentId ? agentId.slice(0,8)+'...' : 'missing',
+        phone, mode, authed
       });
 
       // Reset session state
       seq = 0; chunk = 0; tsMs = 0;
       elBuffer = []; elBufferedFrames = 0; totalFramesSent = 0; totalAudioReceived = 0;
       elOpen = false; elReady = false; elHasSpoken = false; userHasSpoken = false;
-      conversationStarted = false; firstUserInput = true;
-      lastAgentAudioTime = 0;
+      conversationStarted = false; firstUserInput = true; lastAgentAudioTime = 0;
       resetUtterance();
 
-      if (LOOPBACK_ONLY) {
-        log('MODE', 'Running in loopback mode - no ElevenLabs connection');
-        return;
-      }
+      if (LOOPBACK_ONLY) { log('MODE','Loopback mode – no EL connection'); return; }
+      if (!ELEVENLABS_API_KEY) { log('ERROR','ELEVENLABS_API_KEY not set'); return; }
+      if (!agentId) { log('ERROR', `No agent ID for mode=${mode}`); return; }
 
-      if (!ELEVENLABS_API_KEY) {
-        log('ERROR', 'ELEVENLABS_API_KEY not configured');
-        return;
-      }
-
-      if (!agentId) {
-        log('ERROR', `No agent ID configured for mode: ${mode}`);
-        return;
-      }
-
-      // Connect to ElevenLabs
       connectToElevenLabs(agentId, phone, sessionId);
       return;
     }
 
     if (event === 'media') {
+      // Forward ONLY inbound mic audio
+      const track = msg?.media?.track;
+      if (track && track !== 'inbound') return;
+
       const muLawB64 = msg?.media?.payload;
-      if (!muLawB64) {
-        log('ERROR', 'Media event missing payload');
-        return;
-      }
+      if (!muLawB64) { log('ERROR','Media missing payload'); return; }
+      if (!authed) return;
 
       totalAudioReceived++;
 
-      // DEBUG: Log first 20 media frames in detail
-      if (totalAudioReceived <= 20) {
-        log('MEDIA_DEBUG', `Frame ${totalAudioReceived} received`, { 
-          payloadLength: muLawB64.length,
-          speaking: speaking,
-          elReady: elReady,
-          lastAgentTime: lastAgentAudioTime,
-          currentTime: Date.now(),
-          timeSinceAgent: Date.now() - (lastAgentAudioTime || 0)
-        });
-      }
+      // VAD (basic: if enough time since agent spoke or agent hasn't spoken yet)
+      const now = Date.now();
+      const sinceAgent = now - (lastAgentAudioTime || 0);
+      if (!speaking && (sinceAgent > 500 || !elHasSpoken || !elOpen)) {
+        speaking = true; userHasSpoken = true;
+        log('VAD', 'User started speaking', { totalFrames: totalAudioReceived, sinceAgent, elHasSpoken, elOpen });
 
-      // Enhanced Voice Activity Detection
-      const currentTime = Date.now();
-      const timeSinceLastAgent = currentTime - (lastAgentAudioTime || 0);
-      
-      // Trigger user speech detection if:
-      // 1. Not currently speaking AND
-      // 2. Either enough time passed since agent spoke (500ms) OR agent hasn't spoken yet OR EL not ready
-      if (!speaking && (timeSinceLastAgent > 500 || !elHasSpoken || !elOpen)) {
-        speaking = true;
-        userHasSpoken = true;
-        log('VAD', 'User started speaking', { 
-          totalFrames: totalAudioReceived,
-          timeSinceAgent: timeSinceLastAgent,
-          elHasSpoken: elHasSpoken
-        });
-
-        // Send user audio start signal to ElevenLabs
         if (elWs && elOpen) {
-          try {
-            elWs.send(JSON.stringify({ type: "user_audio_start" }));
-            log('EL_SEND', 'user_audio_start signal sent');
-          } catch (e) {
-            log('ERROR', 'Failed to send user_audio_start', { error: e.message });
-          }
+          try { elWs.send(JSON.stringify({ type: "user_audio_start" })); log('EL_SEND','user_audio_start'); }
+          catch (e) { log('ERROR','user_audio_start failed',{ error:e.message }); }
         }
-
-        // Set hard cap timer to prevent infinite user turns
         clearTimeout(utterCapTimer);
-        utterCapTimer = setTimeout(() => {
-          log('VAD', 'Hard cap reached - ending user turn');
-          endUserTurn('hard_cap');
-        }, UTTER_MAX_MS);
+        utterCapTimer = setTimeout(() => { log('VAD','Hard cap -> end'); endUserTurn('hard_cap'); }, UTTER_MAX_MS);
       }
 
-      // Always buffer the audio regardless of VAD state
+      // Buffer μ-law audio for EL
       try {
         const audioBytes = Buffer.from(muLawB64, 'base64');
         elBuffer.push(audioBytes);
         elBufferedFrames += 1;
 
-        // Log first few audio packets for debugging
         if (totalAudioReceived <= 10) {
-          log('AUDIO', `Buffered frame ${totalAudioReceived}`, { 
-            bytes: audioBytes.length,
-            speaking: speaking,
-            elReady: elReady,
-            bufferFrames: elBufferedFrames
+          log('AUDIO', `Buffered frame ${totalAudioReceived}`, {
+            bytes: audioBytes.length, speaking, elReady, bufferFrames: elBufferedFrames
           });
         }
-
-        // Immediate flush if we have enough frames
-        if (elBufferedFrames >= FRAMES_PER_PACKET && elOpen && elReady) {
+        if (elBufferedFrames >= Math.max(1, Math.round(EL_BUFFER_MS / 20)) && elOpen && elReady) {
           flushElBuffer('immediate');
         }
-      } catch (e) {
-        log('ERROR', 'Failed to buffer audio', { error: e.message });
-      }
+      } catch (e) { log('ERROR','Failed to buffer audio', { error:e.message }); }
 
-      // Loopback mode for testing
-      if (LOOPBACK_ONLY) {
-        sendAudioToTwilio(muLawB64);
-      }
+      if (LOOPBACK_ONLY) sendAudioToTwilio(muLawB64);
 
-      // Reset silence timer only if we're in a speaking state
       if (speaking) {
         clearTimeout(silenceTimer);
-        silenceTimer = setTimeout(() => {
-          log('VAD', 'Silence detected - ending user turn');
-          endUserTurn('silence');
-        }, SILENCE_MS);
+        silenceTimer = setTimeout(() => { log('VAD','Silence -> end'); endUserTurn('silence'); }, SILENCE_MS);
       }
-
       return;
     }
 
     if (event === 'mark') {
-      if (LOG_MARK_ACKS) {
-        log('TWILIO', 'Mark acknowledgment received', { mark: msg.mark });
-      }
+      if (LOG_MARK_ACKS) log('TWILIO','Mark ack',{ mark: msg.mark });
       return;
     }
 
     if (event === 'stop') {
-      log('TWILIO', 'Stream stop event received');
-      
-      // Final flush
+      log('TWILIO','Stop received');
       flushElBuffer('stop');
-      
-      // Send final signals to ElevenLabs
       if (elWs && elOpen) {
+        try { elWs.send(JSON.stringify({ type: "user_audio_end" })); log('EL_SEND','Final user_audio_end'); } catch {}
         try {
-          elWs.send(JSON.stringify({ type: "user_audio_end" }));
-          log('EL_SEND', 'Final user_audio_end sent');
-        } catch {}
-
-        try {
-          elWs.send(JSON.stringify({
-            type: "user_message",
-            user_message: { message: "(Call ended)" }
-          }));
-          log('EL_SEND', 'Call end notification sent');
+          elWs.send(JSON.stringify({ type:"user_message", user_message:{ message:"(Call ended)" } }));
+          log('EL_SEND','Call end msg');
         } catch {}
       }
-
-      cleanup();
-      try { twilioWs.close(1000); } catch {}
+      cleanup(); try { twilioWs.close(1000); } catch {}
       return;
     }
 
-    log('TWILIO', 'Unhandled event', { event });
+    log('TWILIO','Unhandled event',{ event });
   });
 
-  // Helper function to end user turns properly
   function endUserTurn(reason) {
-    log('VAD', `Ending user turn: ${reason}`);
-
-    // Flush any remaining audio
+    log('VAD', `End user turn: ${reason}`);
     flushElBuffer(`end_${reason}`);
 
     if (elWs && elOpen) {
-      try {
-        // Send end signal
-        elWs.send(JSON.stringify({ type: "user_audio_end" }));
-        log('EL_SEND', `user_audio_end sent (${reason})`);
-      } catch (e) {
-        log('ERROR', 'Failed to send user_audio_end', { error: e.message });
-      }
-
-      // Double end signal after delay (EL sometimes needs this)
-      setTimeout(() => {
-        if (elWs && elOpen) {
-          try {
-            elWs.send(JSON.stringify({ type: "user_audio_end" }));
-            log('EL_SEND', 'user_audio_end re-sent');
-          } catch {}
-        }
-      }, 150);
-
-      // Force processing nudge
-      setTimeout(() => {
-        if (elWs && elOpen) {
-          try {
-            elWs.send(JSON.stringify({
-              type: "user_message",
-              user_message: { message: "(User finished speaking - please respond)" }
-            }));
-            log('EL_SEND', 'Processing nudge sent');
-          } catch {}
-        }
-      }, 250);
+      try { elWs.send(JSON.stringify({ type:"user_audio_end" })); log('EL_SEND',`user_audio_end (${reason})`); } catch (e){}
+      setTimeout(() => { if (elWs && elOpen) { try { elWs.send(JSON.stringify({ type:"user_audio_end" })); log('EL_SEND','user_audio_end re-sent'); } catch {} } }, 150);
+      setTimeout(() => { if (elWs && elOpen) { try {
+        elWs.send(JSON.stringify({ type:"user_message", user_message:{ message:"(User finished speaking - please respond)" } }));
+        log('EL_SEND','Processing nudge');
+      } catch {} } }, 250);
     }
-
     resetUtterance();
   }
 
-  // Helper function to send audio to Twilio
   function sendAudioToTwilio(audioB64) {
     if (!twilioStreamSid) return;
-
     try {
       const mediaMessage = {
         event: 'media',
         streamSid: twilioStreamSid,
         sequenceNumber: String(++seq),
-        media: {
-          track: 'outbound',
-          chunk: String(++chunk),
-          timestamp: String(tsMs),
-          payload: audioB64
-        }
+        media: { track:'outbound', chunk:String(++chunk), timestamp:String(tsMs), payload: audioB64 }
       };
-
-      const markMessage = {
-        event: 'mark',
-        streamSid: twilioStreamSid,
-        mark: { name: `maggie-chunk-${chunk}` }
-      };
-
+      const markMessage = { event:'mark', streamSid: twilioStreamSid, mark:{ name:`maggie-chunk-${chunk}` } };
       twilioWs.send(JSON.stringify(mediaMessage));
       twilioWs.send(JSON.stringify(markMessage));
-
       tsMs += 20;
-
       if (LOG_FRAMES_EVERY > 0 && (seq % LOG_FRAMES_EVERY === 0)) {
-        log('TWILIO_SEND', 'Audio frame sent', {
-          seq, chunk, tsMs,
-          bytes: Buffer.from(audioB64, 'base64').length
-        });
+        log('TWILIO_SEND','Audio frame sent',{ seq, chunk, tsMs, bytes: Buffer.from(audioB64,'base64').length });
       }
-    } catch (e) {
-      log('ERROR', 'Failed to send audio to Twilio', { error: e.message });
-    }
+    } catch (e) { log('ERROR','Send audio to Twilio failed',{ error:e.message }); }
   }
 
-  // ElevenLabs connection function
-  function connectToElevenLabs(agentId, phone, sessionId) {
-    const endpoints = [
-      `wss://api.elevenlabs.io/v1/convai/ws?agent_id=${encodeURIComponent(agentId)}`,
-      `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(agentId)}`
+  // ---------- ElevenLabs connection (signed URL -> /convai/twilio fallback)
+
+  function pickElAudioB64(msg) {
+    const cands = [
+      msg?.audio,
+      msg?.audio_base64,
+      msg?.audio_base_64,
+      msg?.audio_event?.audio,
+      msg?.audio_event?.audio_base64,
+      msg?.audio_event?.audio_base_64,
+      msg?.tts_event?.audio_base_64,
+      msg?.response?.audio,
+      msg?.chunk?.audio
     ];
+    for (const s of cands) if (typeof s === 'string' && s.length > 32) return s;
+    for (const v of Object.values(msg || {})) {
+      if (typeof v === 'string' && v.length > 128 && /^[A-Za-z0-9+/=]+$/.test(v)) return v;
+      if (v && typeof v === 'object') {
+        for (const v2 of Object.values(v)) {
+          if (typeof v2 === 'string' && v2.length > 128 && /^[A-Za-z0-9+/=]+$/.test(v2)) return v2;
+        }
+      }
+    }
+    return null;
+  }
 
+  async function connectToElevenLabs(agentId, phone, sessionId) {
     const headers = { 'xi-api-key': ELEVENLABS_API_KEY };
-    let endpointIndex = 0;
 
-    const connect = () => {
-      const endpoint = endpoints[endpointIndex];
-      const endpointName = endpointIndex === 0 ? '/ws' : '/conversation';
-      
-      log('EL_CONNECT', `Connecting to ElevenLabs ${endpointName}`, { 
-        agentId: agentId.substring(0, 8) + '...' 
+    async function getSignedUrl() {
+      const r = await fetch(
+        `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${encodeURIComponent(agentId)}`,
+        { headers }
+      );
+      if (!r.ok) throw new Error(`get_signed_url ${r.status}`);
+      const { signed_url } = await r.json();
+      return signed_url;
+    }
+
+    function openWs(endpoint) {
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(endpoint, { headers });
+        ws.once('open', () => resolve(ws));
+        ws.once('error', reject);
       });
+    }
 
-      elWs = new WebSocket(endpoint, { headers });
-
-      elWs.on('error', (err) => {
-        log('ERROR', `ElevenLabs connection error (${endpointName})`, { error: err.message });
-        
-        try { elWs.close(); } catch {}
-        
-        if (endpointIndex === 0) {
-          endpointIndex = 1;
-          log('EL_CONNECT', 'Falling back to /conversation endpoint');
-          setTimeout(connect, 300);
-        } else {
-          log('ERROR', 'All ElevenLabs endpoints failed');
-        }
-      });
-
-      elWs.on('open', () => {
+    try {
+      const signedUrl = await getSignedUrl();
+      elWs = await openWs(signedUrl);
+      elOpen = true;
+      log('EL_CONNECT','Connected via signed URL');
+    } catch (e) {
+      log('EL_CONNECT', `Signed URL failed (${e.message}), fallback to /convai/twilio`);
+      try {
+        elWs = await openWs(`wss://api.elevenlabs.io/v1/convai/twilio?agent_id=${encodeURIComponent(agentId)}`);
         elOpen = true;
-        log('EL_CONNECT', `Connected successfully via ${endpointName}`);
+        log('EL_CONNECT','Connected via /convai/twilio');
+      } catch (e2) {
+        log('ERROR', `EL connect failed: ${e2.message}`);
+        return;
+      }
+    }
 
-        // Send initialization
-        const initMessage = {
-          type: "conversation_initiation_client_data",
-          conversation_initiation_client_data: {
-            dynamic_variables: {
-              caller_phone: phone || "",
-              mode: mode,
-              session_id: sessionId,
-              timestamp: new Date().toISOString()
-            }
-          }
-        };
-
-        try {
-          elWs.send(JSON.stringify(initMessage));
-          log('EL_SEND', 'Initialization data sent', { phone, mode });
-        } catch (e) {
-          log('ERROR', 'Failed to send initialization', { error: e.message });
+    try {
+      elWs.send(JSON.stringify({
+        type: "conversation_initiation_client_data",
+        conversation_initiation_client_data: {
+          dynamic_variables: { caller_phone: phone || "", mode, session_id: sessionId, timestamp: new Date().toISOString() }
         }
+      }));
+      log('EL_SEND','Init data sent', { phone, mode });
+    } catch (e) { log('ERROR','Init send failed', { error:e.message }); }
 
-        // Progressive nudging strategy to ensure agent starts talking
-        nudge1 = setTimeout(() => {
-          if (!elHasSpoken && elWs && elOpen) {
-            try {
-              elWs.send(JSON.stringify({
-                type: "user_message",
-                user_message: { message: "Hello" }
-              }));
-              log('EL_SEND', 'First nudge sent (Hello)');
-            } catch {}
-          }
-        }, 2000);
+    elWs.on('message', (data) => {
+      let message; try { message = JSON.parse(data.toString()); }
+      catch { log('EL_RECV','Non-JSON msg',{ sample: String(data).slice(0,120)}); return; }
 
-        nudge2 = setTimeout(() => {
-          if (!elHasSpoken && elWs && elOpen) {
-            try {
-              elWs.send(JSON.stringify({
-                type: "user_message",
-                user_message: { message: "Please start the conversation" }
-              }));
-              log('EL_SEND', 'Second nudge sent');
-            } catch {}
-          }
-        }, 4000);
+      // keepalive
+      if (message?.type === 'ping' && message.ping_event?.event_id) {
+        try { elWs.send(JSON.stringify({ type:'pong', event_id: message.ping_event.event_id })); log('EL_SEND','Pong',{ eventId: message.ping_event.event_id }); } catch (e) { log('ERROR','Pong failed',{ error:e.message }); }
+        return;
+      }
 
-        nudge3 = setTimeout(() => {
-          if (!elHasSpoken && elWs && elOpen) {
-            try {
-              elWs.send(JSON.stringify({ type: "conversation_start" }));
-              log('EL_SEND', 'Conversation start nudge sent');
-            } catch {}
-          }
-        }, 6000);
-      });
+      // barge-in
+      if (message?.type === 'interruption' && twilioStreamSid) {
+        try { twilioWs.send(JSON.stringify({ event:'clear', streamSid: twilioStreamSid })); log('EL_RECV','Interruption -> clear'); } catch {}
+      }
 
-      elWs.on('message', (data) => {
-        let message;
-        try {
-          message = JSON.parse(data.toString());
-        } catch {
-          log('EL_RECV', 'Non-JSON message received', { data: String(data).slice(0, 200) });
-          return;
+      if (message?.type === 'conversation_initiation_metadata') {
+        const md = message.conversation_initiation_metadata_event || {};
+        elInFormat = md.user_input_audio_format;
+        elOutFormat = md.agent_output_audio_format;
+        elReady = true; conversationStarted = true;
+        log('EL_RECV','Metadata',{ elInFormat, elOutFormat });
+        if (elBufferedFrames > 0) flushElBuffer('metadata_ready');
+        return;
+      }
+
+      // agent audio out (various shapes)
+      const b64 = pickElAudioB64(message);
+      if (b64) {
+        if (!elHasSpoken) {
+          elHasSpoken = true;
+          clearTimeout(nudge1); clearTimeout(nudge2); clearTimeout(nudge3);
+          log('EL_RECV','First audio from agent');
         }
+        lastAgentAudioTime = Date.now();
+        resetUtterance();
 
-        // Handle errors
-        if (message?.error || message?.type === 'error') {
-          log('ERROR', 'ElevenLabs error message', { error: message });
-          return;
-        }
-
-        // Handle metadata (format configuration)
-        if (message?.type === 'conversation_initiation_metadata') {
-          const metadata = message.conversation_initiation_metadata_event || {};
-          elInFormat = metadata.user_input_audio_format;
-          elOutFormat = metadata.agent_output_audio_format;
-          elReady = true;
-          conversationStarted = true;
-
-          log('EL_RECV', 'Metadata received - ready for audio', {
-            userFormat: elInFormat,
-            agentFormat: elOutFormat
-          });
-
-          // Flush any buffered audio now that we're ready
-          if (elBufferedFrames > 0) {
-            log('EL_SEND', 'Flushing buffered audio after metadata');
-            flushElBuffer('metadata_ready');
+        let outBuf = Buffer.from(b64, 'base64');
+        if (elOutFormat && /ulaw_?8000/i.test(elOutFormat)) {
+          for (let o = 0; o < outBuf.length; o += 160) {
+            const slice = outBuf.subarray(o, Math.min(o + 160, outBuf.length));
+            sendAudioToTwilio(slice.toString('base64'));
           }
-          return;
-        }
-
-        // Handle audio responses from agent
-        if (message?.type === 'audio' && message.audio_event?.audio_base_64) {
-          if (!elHasSpoken) {
-            elHasSpoken = true;
-            log('EL_RECV', 'First audio response received from ElevenLabs!');
-            clearTimeout(nudge1);
-            clearTimeout(nudge2);
-            clearTimeout(nudge3);
+        } else {
+          if (elOutFormat && /16k|16000/i.test(elOutFormat)) outBuf = downsamplePcm16Mono16kTo8k(outBuf);
+          const mu = pcm16ToMuLaw(outBuf);
+          for (let o = 0; o < mu.length; o += 160) {
+            const slice = mu.subarray(o, Math.min(o + 160, mu.length));
+            sendAudioToTwilio(slice.toString('base64'));
           }
-
-          // Track when agent finishes speaking for VAD timing
-          lastAgentAudioTime = Date.now();
-          resetUtterance();
-          
-          const audioB64 = message.audio_event.audio_base_64;
-          const audioBytes = Buffer.from(audioB64, 'base64').length;
-          
-          log('EL_RECV', 'Audio chunk received', { bytes: audioBytes, format: elOutFormat });
-
-          // Process audio based on format and send to Twilio
-          if (elOutFormat === 'ulaw_8000') {
-            // Direct µ-law - send in 20ms chunks (160 bytes each)
-            const ulawBuffer = Buffer.from(audioB64, 'base64');
-            for (let offset = 0; offset < ulawBuffer.length; offset += 160) {
-              const slice = ulawBuffer.subarray(offset, Math.min(offset + 160, ulawBuffer.length));
-              sendAudioToTwilio(slice.toString('base64'));
-            }
-          } else {
-            // Assume PCM16 and convert to µ-law for Twilio
-            const pcm16Buffer = Buffer.from(audioB64, 'base64');
-            let processedBuffer = pcm16Buffer;
-            
-            // Downsample if needed (16kHz -> 8kHz)
-            if (elOutFormat.includes('16000') || elOutFormat.includes('16k')) {
-              processedBuffer = downsamplePcm16Mono16kTo8k(pcm16Buffer);
-            }
-            
-            // Convert to µ-law
-            const muLawBuffer = pcm16ToMuLaw(processedBuffer);
-            
-            // Send in 20ms chunks (160 bytes each)
-            for (let offset = 0; offset < muLawBuffer.length; offset += 160) {
-              const slice = muLawBuffer.subarray(offset, Math.min(offset + 160, muLawBuffer.length));
-              sendAudioToTwilio(slice.toString('base64'));
-            }
-          }
-          return;
         }
+        return;
+      }
 
-        // Handle user transcripts
-        if (message?.type === 'user_transcript') {
-          const transcript = message.user_transcription_event?.user_transcript;
-          log('EL_RECV', 'User transcript received', { transcript });
+      if (message?.type === 'user_transcript') {
+        log('EL_RECV','User transcript',{ t: message.user_transcription_event?.user_transcript });
+        return;
+      }
+      if (message?.type === 'agent_response') {
+        log('EL_RECV','Agent text',{ r: message.agent_response_event?.agent_response });
+        return;
+      }
 
-          // If we get transcripts but no audio responses after delay, nudge
-          if (transcript && transcript.length > 5) {
-            setTimeout(() => {
-              if (!elHasSpoken && elWs && elOpen) {
-                try {
-                  elWs.send(JSON.stringify({
-                    type: "user_message",
-                    user_message: { message: "Please respond to what I just said" }
-                  }));
-                  log('EL_SEND', 'Post-transcript nudge sent');
-                } catch {}
-              }
-            }, 1000);
-          }
-          return;
-        }
+      log('EL_RECV','Unhandled',{ type: message?.type, keys: Object.keys(message || {}) });
+    });
 
-        // Handle agent text responses
-        if (message?.type === 'agent_response') {
-          const response = message.agent_response_event?.agent_response;
-          log('EL_RECV', 'Agent text response', { response });
+    elWs.on('close', (code, reason) => {
+      elOpen = false; elReady = false;
+      log('EL_CONNECT','Closed',{ code, reason: reason?.toString() || '' });
+    });
 
-          // If we get text but no audio, might be voice configuration issue
-          if (response && !elHasSpoken) {
-            log('WARNING', 'Got text response but no audio - check agent voice settings');
-          }
-          return;
-        }
+    elWs.on('error', (e) => log('ERROR','EL socket error',{ err: e.message }));
 
-        // Handle ping/pong keepalive
-        if (message?.type === 'ping') {
-          const eventId = message.ping_event?.event_id;
-          try {
-            elWs.send(JSON.stringify({
-              type: 'pong',
-              event_id: eventId
-            }));
-            log('EL_SEND', 'Pong sent', { eventId });
-          } catch (e) {
-            log('ERROR', 'Failed to send pong', { error: e.message });
-          }
-          return;
-        }
-
-        // Log unhandled message types
-        log('EL_RECV', 'Unhandled message type', {
-          type: message?.type,
-          keys: Object.keys(message || {})
-        });
-      });
-
-      elWs.on('close', (code, reason) => {
-        elOpen = false;
-        elReady = false;
-        const reasonStr = reason?.toString() || 'No reason';
-        log('EL_CONNECT', 'Connection closed', { code, reason: reasonStr });
-
-        // Retry on unexpected closure with first endpoint
-        if (endpointIndex === 0 && code !== 1000) {
-          endpointIndex = 1;
-          log('EL_CONNECT', 'Retrying with /conversation endpoint');
-          setTimeout(connect, 300);
-        }
-      });
-    };
-
-    connect();
+    // Gentle “start talking” nudges if nothing comes back
+    nudge1 = setTimeout(() => {
+      if (!elHasSpoken && elWs && elOpen) {
+        try { elWs.send(JSON.stringify({ type:"user_message", user_message:{ message:"Hello" } })); log('EL_SEND','Nudge1'); } catch {}
+      }
+    }, 2000);
+    nudge2 = setTimeout(() => {
+      if (!elHasSpoken && elWs && elOpen) {
+        try { elWs.send(JSON.stringify({ type:"user_message", user_message:{ message:"Please start the conversation" } })); log('EL_SEND','Nudge2'); } catch {}
+      }
+    }, 4000);
+    nudge3 = setTimeout(() => {
+      if (!elHasSpoken && elWs && elOpen) {
+        try { elWs.send(JSON.stringify({ type:"conversation_start" })); log('EL_SEND','Nudge3 conversation_start'); } catch {}
+      }
+    }, 6000);
   }
 }
 
-// ================== Audio Conversion Utilities ==================
+// ================== Audio utils ==================
 
+// NOTE: This μ-law encoder assumes 16-bit PCM input if you use it directly.
+// In this bridge we send μ-law from Twilio to EL unchanged; this is only used
+// to convert agent PCM back to Twilio if EL doesn't output μ-law.
 function pcm16ToMuLaw(pcmBuffer) {
-  const muLawBuffer = Buffer.alloc(pcmBuffer.length);
-  
-  for (let i = 0; i < pcmBuffer.length; i++) {
-    let sample = pcmBuffer[i];
-    let sign = (sample < 0) ? 0x80 : 0;
-    
-    if (sample < 0) sample = -sample;
-    if (sample > 32635) sample = 32635;
-    
-    sample += 132;
-    let exponent = 7;
-    
-    for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; expMask >>= 1) {
-      exponent--;
-    }
-    
-    const mantissa = (sample >> (exponent + 3)) & 0x0F;
-    muLawBuffer[i] = ~(sign | (exponent << 4) | mantissa) & 0xFF;
+  // Interpret as signed 16-bit
+  const view = new DataView(pcmBuffer.buffer, pcmBuffer.byteOffset, pcmBuffer.byteLength);
+  const out = Buffer.alloc(Math.floor(pcmBuffer.byteLength / 2));
+  for (let i = 0, j = 0; i < pcmBuffer.byteLength; i += 2, j++) {
+    const s = view.getInt16(i, true); // LE
+    out[j] = linear2ulaw(s);
   }
-  
-  return muLawBuffer;
+  return out;
+}
+
+function linear2ulaw(sample) {
+  const MULAW_MAX = 0x1FFF;
+  const MULAW_BIAS = 0x84;
+  let sign = (sample >> 8) & 0x80;
+  if (sign !== 0) sample = -sample;
+  if (sample > MULAW_MAX) sample = MULAW_MAX;
+  sample = sample + MULAW_BIAS;
+  const exponent = ulawExp(sample);
+  const mantissa = (sample >> (exponent + 3)) & 0x0F;
+  let ulawbyte = ~(sign | (exponent << 4) | mantissa);
+  return ulawbyte & 0xFF;
+}
+
+function ulawExp(sample) {
+  if (sample >= 256) {
+    if (sample >= 512) {
+      if (sample >= 1024) {
+        if (sample >= 2048) return 7;
+        return 6;
+      }
+      return 5;
+    }
+    if (sample >= 128) return 4;
+    return 3;
+  }
+  if (sample >= 64) return 2;
+  if (sample >= 32) return 1;
+  return 0;
 }
 
 function downsamplePcm16Mono16kTo8k(pcm16Buffer) {
-  const input16 = new Int16Array(
-    pcm16Buffer.buffer,
-    pcm16Buffer.byteOffset,
-    Math.floor(pcm16Buffer.byteLength / 2)
-  );
-  
+  // naive decimation: take every other sample
+  const input16 = new Int16Array(pcm16Buffer.buffer, pcm16Buffer.byteOffset, Math.floor(pcm16Buffer.byteLength / 2));
   const outputLength = Math.floor(input16.length / 2);
   const output16 = new Int16Array(outputLength);
-  
-  for (let i = 0, j = 0; j < outputLength; i += 2, j++) {
-    output16[j] = input16[i];
-  }
-  
+  for (let i = 0, j = 0; j < outputLength; i += 2, j++) output16[j] = input16[i];
   return Buffer.from(output16.buffer);
 }
 
-// ================== Utilities ==================
+// ================== Misc ==================
 
 function generateSessionId() {
-  return Math.random().toString(36).substring(2, 10);
+  return Math.random().toString(36).slice(2, 10);
 }
 
-console.log('[STARTUP] MeetMaggie Voice Bridge ready for connections');
+console.log('[STARTUP] MeetMaggie Voice Bridge ready');
