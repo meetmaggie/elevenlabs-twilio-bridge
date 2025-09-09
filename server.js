@@ -1,4 +1,6 @@
-// server.js – MeetMaggie Twilio <-> ElevenLabs bridge (v2.2)
+// server.js – MeetMaggie Twilio <-> ElevenLabs bridge (v2.3)
+// - FIX: Optimistic readiness if EL metadata doesn't arrive (EL_READY_FALLBACK_MS)
+// - FIX: Don't block mic flushes on elReady; require only elOpen
 // - Uses signed URL first, falls back to /convai/twilio
 // - Sends caller mic as { user_audio_chunk: "<base64 μ-law 8k 20ms>" }
 // - Forwards ONLY inbound audio from Twilio
@@ -14,20 +16,7 @@
 //   LOOPBACK_ONLY=0|1 (optional)
 //   SILENCE_MS=800 EL_BUFFER_MS=200 UTTER_MAX_MS=3000 (optional tuning)
 //   LOG_FRAMES_EVERY=20 LOG_MARK_ACKS=0 DEBUG_AUDIO=0 (optional)
-//
-// TwiML example:
-/*
-<Response>
-  <Connect>
-    <Stream url="wss://<your-railway-domain>/ws">
-      <Parameter name="token" value="YOUR_BRIDGE_AUTH_TOKEN"/>
-      <Parameter name="mode" value="discovery"/> <!-- or "daily" -->
-      <Parameter name="agent_id" value="agent_XXXXXXXXXXXX"/> <!-- optional -->
-      <Parameter name="caller_phone" value="+441234567890"/>
-    </Stream>
-  </Connect>
-</Response>
-*/
+//   EL_READY_FALLBACK_MS=1000 (optional; optimistic ready if metadata is late)
 
 const http = require('http');
 const url = require('url');
@@ -46,11 +35,12 @@ const LOG_MARK_ACKS = (process.env.LOG_MARK_ACKS || '0').trim() === '1';
 const SILENCE_MS = parseInt(process.env.SILENCE_MS || '800', 10);
 const EL_BUFFER_MS = parseInt(process.env.EL_BUFFER_MS || '200', 10);
 const UTTER_MAX_MS = parseInt(process.env.UTTER_MAX_MS || '3000', 10);
+const EL_READY_FALLBACK_MS = parseInt(process.env.EL_READY_FALLBACK_MS || '1000', 10);
 const FRAMES_PER_PACKET = Math.max(1, Math.round(EL_BUFFER_MS / 20));
 
-console.log(`[STARTUP] MeetMaggie Voice Bridge v2.2 starting...`);
+console.log(`[STARTUP] MeetMaggie Voice Bridge v2.3 starting...`);
 console.log(`[CONFIG] SILENCE_MS=${SILENCE_MS}, EL_BUFFER_MS=${EL_BUFFER_MS}, UTTER_MAX_MS=${UTTER_MAX_MS}`);
-console.log(`[CONFIG] FRAMES_PER_PACKET=${FRAMES_PER_PACKET}, LOOPBACK_ONLY=${LOOPBACK_ONLY}`);
+console.log(`[CONFIG] EL_READY_FALLBACK_MS=${EL_READY_FALLBACK_MS}, FRAMES_PER_PACKET=${FRAMES_PER_PACKET}, LOOPBACK_ONLY=${LOOPBACK_ONLY}`);
 
 const server = http.createServer((req, res) => {
   const corsHeaders = {
@@ -58,21 +48,19 @@ const server = http.createServer((req, res) => {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type'
   };
-  if (req.method === 'OPTIONS') {
-    res.writeHead(200, corsHeaders); return res.end();
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(200, corsHeaders); return res.end(); }
   if (req.url === '/health') {
     res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({
       status: 'healthy',
-      service: 'MeetMaggie Voice Bridge v2.2',
+      service: 'MeetMaggie Voice Bridge v2.3',
       timestamp: new Date().toISOString(),
       activeConnections: wss ? wss.clients.size : 0
     }));
   }
   if (req.url === '/' || req.url === '/status') {
     res.writeHead(200, { ...corsHeaders, 'Content-Type': 'text/plain' });
-    return res.end('MeetMaggie Voice Bridge v2.2: Ready for calls');
+    return res.end('MeetMaggie Voice Bridge v2.3: Ready for calls');
   }
   res.writeHead(404, { ...corsHeaders, 'Content-Type': 'text/plain' });
   res.end('Not found');
@@ -83,12 +71,10 @@ const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
   console.log(`[WS] Upgrade request: ${pathname}`);
-
   if (pathname !== '/ws' && pathname !== '/media-stream') {
     console.warn('[WS] Invalid path attempted:', pathname);
     return socket.destroy();
   }
-  // Optional URL-level token (useful for quick tests; primary auth is via customParameters)
   if (BRIDGE_AUTH_TOKEN && query && query.token && query.token !== BRIDGE_AUTH_TOKEN) {
     console.warn('[WS] Rejected: bad token in URL query');
     return socket.destroy();
@@ -104,14 +90,12 @@ wss.on('connection', (twilioWs, req) => {
   attachBridgeHandlers(twilioWs, req.__query || {});
 });
 
-// Health logging
 setInterval(() => {
   console.log(`[HEARTBEAT] Active connections: ${wss.clients.size} @ ${new Date().toISOString()}`);
 }, 60_000);
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('[SHUTDOWN] Graceful shutdown'); 
+  console.log('[SHUTDOWN] Graceful shutdown');
   try { server.close(() => process.exit(0)); } catch { process.exit(0); }
 });
 
@@ -127,11 +111,12 @@ function attachBridgeHandlers(twilioWs, query = {}) {
   const startedAt = Date.now();
   let twilioStreamSid = null;
   let agentId = null, mode = 'discovery', phone = '';
-  let authed = !BRIDGE_AUTH_TOKEN; // if no token configured, treat as authed
+  let authed = !BRIDGE_AUTH_TOKEN;
 
   // EL state
   let elWs = null, elOpen = false, elReady = false, conversationStarted = false;
   let elInFormat = null, elOutFormat = null;
+  let mdTimer = null; // metadata fallback timer
 
   // Audio/VAD state
   let seq = 0, chunk = 0, tsMs = 0;
@@ -161,18 +146,18 @@ function attachBridgeHandlers(twilioWs, query = {}) {
     clearTimeout(utterCapTimer);
   };
 
+  // --------- FLUSH: now requires elOpen only (not elReady) ----------
   const flushElBuffer = (label = 'flush') => {
     if (!elBufferedFrames) return;
-    const merged = Buffer.concat(elBuffer); // μ-law bytes, 20ms per 160B
+    const merged = Buffer.concat(elBuffer); // μ-law 8k bytes
     const durationMs = elBufferedFrames * 20;
 
-    if (!elOpen || !elReady) {
-      log('BUF', `${label} deferred`, { durationMs, bytes: merged.length, elOpen, elReady });
+    if (!elOpen) {
+      log('BUF', `${label} deferred - EL not open`, { durationMs, bytes: merged.length, elOpen, elReady });
       return;
     }
 
     try {
-      // Send in 20ms frames as user_audio_chunk
       for (let o = 0; o < merged.length; o += 160) {
         const slice = merged.subarray(o, Math.min(o + 160, merged.length));
         elWs.send(JSON.stringify({ user_audio_chunk: slice.toString('base64') }));
@@ -211,6 +196,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
     clearTimeout(nudge1);
     clearTimeout(nudge2);
     clearTimeout(nudge3);
+    clearTimeout(mdTimer);
     if (elWs) { try { elWs.close(1000); } catch {} }
   };
 
@@ -271,17 +257,14 @@ function attachBridgeHandlers(twilioWs, query = {}) {
     }
 
     if (event === 'media') {
-      // Forward ONLY inbound mic audio
       const track = msg?.media?.track;
       if (track && track !== 'inbound') return;
-
       const muLawB64 = msg?.media?.payload;
       if (!muLawB64) { log('ERROR','Media missing payload'); return; }
       if (!authed) return;
 
       totalAudioReceived++;
 
-      // VAD (basic: if enough time since agent spoke or agent hasn't spoken yet)
       const now = Date.now();
       const sinceAgent = now - (lastAgentAudioTime || 0);
       if (!speaking && (sinceAgent > 500 || !elHasSpoken || !elOpen)) {
@@ -296,18 +279,15 @@ function attachBridgeHandlers(twilioWs, query = {}) {
         utterCapTimer = setTimeout(() => { log('VAD','Hard cap -> end'); endUserTurn('hard_cap'); }, UTTER_MAX_MS);
       }
 
-      // Buffer μ-law audio for EL
       try {
         const audioBytes = Buffer.from(muLawB64, 'base64');
         elBuffer.push(audioBytes);
         elBufferedFrames += 1;
 
         if (totalAudioReceived <= 10) {
-          log('AUDIO', `Buffered frame ${totalAudioReceived}`, {
-            bytes: audioBytes.length, speaking, elReady, bufferFrames: elBufferedFrames
-          });
+          log('AUDIO', `Buffered frame ${totalAudioReceived}`, { bytes: audioBytes.length, speaking, elReady, bufferFrames: elBufferedFrames });
         }
-        if (elBufferedFrames >= Math.max(1, Math.round(EL_BUFFER_MS / 20)) && elOpen && elReady) {
+        if (elBufferedFrames >= Math.max(1, Math.round(EL_BUFFER_MS / 20)) && elOpen) {
           flushElBuffer('immediate');
         }
       } catch (e) { log('ERROR','Failed to buffer audio', { error:e.message }); }
@@ -381,15 +361,9 @@ function attachBridgeHandlers(twilioWs, query = {}) {
 
   function pickElAudioB64(msg) {
     const cands = [
-      msg?.audio,
-      msg?.audio_base64,
-      msg?.audio_base_64,
-      msg?.audio_event?.audio,
-      msg?.audio_event?.audio_base64,
-      msg?.audio_event?.audio_base_64,
-      msg?.tts_event?.audio_base_64,
-      msg?.response?.audio,
-      msg?.chunk?.audio
+      msg?.audio, msg?.audio_base64, msg?.audio_base_64,
+      msg?.audio_event?.audio, msg?.audio_event?.audio_base64, msg?.audio_event?.audio_base_64,
+      msg?.tts_event?.audio_base_64, msg?.response?.audio, msg?.chunk?.audio
     ];
     for (const s of cands) if (typeof s === 'string' && s.length > 32) return s;
     for (const v of Object.values(msg || {})) {
@@ -441,11 +415,28 @@ function attachBridgeHandlers(twilioWs, query = {}) {
       }
     }
 
+    // ---- NEW: optimistic readiness if metadata is late
+    clearTimeout(mdTimer);
+    mdTimer = setTimeout(() => {
+      if (!elReady) {
+        elReady = true; // optimistic
+        log('EL_CONNECT','No metadata; proceeding optimistically',{ EL_READY_FALLBACK_MS });
+        try { elWs.send(JSON.stringify({ type: "conversation_start" })); } catch {}
+        // push any already-buffered mic audio
+        if (elBufferedFrames > 0) flushElBuffer('md-timeout');
+      }
+    }, Math.max(200, EL_READY_FALLBACK_MS));
+
     try {
       elWs.send(JSON.stringify({
         type: "conversation_initiation_client_data",
         conversation_initiation_client_data: {
-          dynamic_variables: { caller_phone: phone || "", mode, session_id: sessionId, timestamp: new Date().toISOString() }
+          dynamic_variables: {
+            caller_phone: phone || "",
+            mode,
+            session_id: sessionId,
+            timestamp: new Date().toISOString()
+          }
         }
       }));
       log('EL_SEND','Init data sent', { phone, mode });
@@ -455,18 +446,17 @@ function attachBridgeHandlers(twilioWs, query = {}) {
       let message; try { message = JSON.parse(data.toString()); }
       catch { log('EL_RECV','Non-JSON msg',{ sample: String(data).slice(0,120)}); return; }
 
-      // keepalive
       if (message?.type === 'ping' && message.ping_event?.event_id) {
         try { elWs.send(JSON.stringify({ type:'pong', event_id: message.ping_event.event_id })); log('EL_SEND','Pong',{ eventId: message.ping_event.event_id }); } catch (e) { log('ERROR','Pong failed',{ error:e.message }); }
         return;
       }
 
-      // barge-in
       if (message?.type === 'interruption' && twilioStreamSid) {
         try { twilioWs.send(JSON.stringify({ event:'clear', streamSid: twilioStreamSid })); log('EL_RECV','Interruption -> clear'); } catch {}
       }
 
       if (message?.type === 'conversation_initiation_metadata') {
+        clearTimeout(mdTimer);
         const md = message.conversation_initiation_metadata_event || {};
         elInFormat = md.user_input_audio_format;
         elOutFormat = md.agent_output_audio_format;
@@ -476,7 +466,6 @@ function attachBridgeHandlers(twilioWs, query = {}) {
         return;
       }
 
-      // agent audio out (various shapes)
       const b64 = pickElAudioB64(message);
       if (b64) {
         if (!elHasSpoken) {
@@ -513,17 +502,23 @@ function attachBridgeHandlers(twilioWs, query = {}) {
         return;
       }
 
+      if (message?.error || message?.type === 'error') {
+        log('ERROR','ElevenLabs error message',{ error: message });
+        return;
+      }
+
       log('EL_RECV','Unhandled',{ type: message?.type, keys: Object.keys(message || {}) });
     });
 
     elWs.on('close', (code, reason) => {
       elOpen = false; elReady = false;
+      clearTimeout(mdTimer);
       log('EL_CONNECT','Closed',{ code, reason: reason?.toString() || '' });
     });
 
     elWs.on('error', (e) => log('ERROR','EL socket error',{ err: e.message }));
 
-    // Gentle “start talking” nudges if nothing comes back
+    // Existing "start talking" nudges (kept)
     nudge1 = setTimeout(() => {
       if (!elHasSpoken && elWs && elOpen) {
         try { elWs.send(JSON.stringify({ type:"user_message", user_message:{ message:"Hello" } })); log('EL_SEND','Nudge1'); } catch {}
@@ -544,23 +539,17 @@ function attachBridgeHandlers(twilioWs, query = {}) {
 
 // ================== Audio utils ==================
 
-// NOTE: This μ-law encoder assumes 16-bit PCM input if you use it directly.
-// In this bridge we send μ-law from Twilio to EL unchanged; this is only used
-// to convert agent PCM back to Twilio if EL doesn't output μ-law.
 function pcm16ToMuLaw(pcmBuffer) {
-  // Interpret as signed 16-bit
   const view = new DataView(pcmBuffer.buffer, pcmBuffer.byteOffset, pcmBuffer.byteLength);
   const out = Buffer.alloc(Math.floor(pcmBuffer.byteLength / 2));
   for (let i = 0, j = 0; i < pcmBuffer.byteLength; i += 2, j++) {
-    const s = view.getInt16(i, true); // LE
+    const s = view.getInt16(i, true);
     out[j] = linear2ulaw(s);
   }
   return out;
 }
-
 function linear2ulaw(sample) {
-  const MULAW_MAX = 0x1FFF;
-  const MULAW_BIAS = 0x84;
+  const MULAW_MAX = 0x1FFF, MULAW_BIAS = 0x84;
   let sign = (sample >> 8) & 0x80;
   if (sign !== 0) sample = -sample;
   if (sample > MULAW_MAX) sample = MULAW_MAX;
@@ -570,26 +559,11 @@ function linear2ulaw(sample) {
   let ulawbyte = ~(sign | (exponent << 4) | mantissa);
   return ulawbyte & 0xFF;
 }
-
 function ulawExp(sample) {
-  if (sample >= 256) {
-    if (sample >= 512) {
-      if (sample >= 1024) {
-        if (sample >= 2048) return 7;
-        return 6;
-      }
-      return 5;
-    }
-    if (sample >= 128) return 4;
-    return 3;
-  }
-  if (sample >= 64) return 2;
-  if (sample >= 32) return 1;
-  return 0;
+  if (sample >= 256) { if (sample >= 512) { if (sample >= 1024) { if (sample >= 2048) return 7; return 6; } return 5; } if (sample >= 128) return 4; return 3; }
+  if (sample >= 64) return 2; if (sample >= 32) return 1; return 0;
 }
-
 function downsamplePcm16Mono16kTo8k(pcm16Buffer) {
-  // naive decimation: take every other sample
   const input16 = new Int16Array(pcm16Buffer.buffer, pcm16Buffer.byteOffset, Math.floor(pcm16Buffer.byteLength / 2));
   const outputLength = Math.floor(input16.length / 2);
   const output16 = new Int16Array(outputLength);
@@ -599,8 +573,6 @@ function downsamplePcm16Mono16kTo8k(pcm16Buffer) {
 
 // ================== Misc ==================
 
-function generateSessionId() {
-  return Math.random().toString(36).slice(2, 10);
-}
+function generateSessionId() { return Math.random().toString(36).slice(2, 10); }
 
 console.log('[STARTUP] MeetMaggie Voice Bridge ready');
