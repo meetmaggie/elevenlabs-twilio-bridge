@@ -230,6 +230,17 @@ function attachBridgeHandlers(twilioWs, query = {}) {
       agentId = cp.agent_id || (mode === 'daily' ? DAILY_ID : DISCOVERY_ID);
       phone = cp.caller_phone || start.from || cp.from || '';
 
+      // --- NEW: parse profile_b64 into JSON (safe, metadata only)
+      const profile_b64 = cp.profile_b64 || '';
+      let profile_json = null;
+      if (profile_b64 && typeof profile_b64 === 'string') {
+        try {
+          profile_json = JSON.parse(Buffer.from(profile_b64, 'base64').toString('utf8'));
+        } catch (e) {
+          log('WARN', 'profile_b64 parse failed', { error: e.message });
+        }
+      }
+
       if (BRIDGE_AUTH_TOKEN) {
         if (token && token === BRIDGE_AUTH_TOKEN) { authed = true; }
         else { log('ERROR', 'Bad/missing token in customParameters'); try { twilioWs.close(1008, 'bad-token'); } catch {} return; }
@@ -238,7 +249,8 @@ function attachBridgeHandlers(twilioWs, query = {}) {
       log('TWILIO', 'Stream started', {
         streamSid: twilioStreamSid,
         agentId: agentId ? agentId.slice(0,8)+'...' : 'missing',
-        phone, mode, authed
+        phone, mode, authed,
+        hasProfile: !!profile_json
       });
 
       // Reset session state
@@ -252,7 +264,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
       if (!ELEVENLABS_API_KEY) { log('ERROR','ELEVENLABS_API_KEY not set'); return; }
       if (!agentId) { log('ERROR', `No agent ID for mode=${mode}`); return; }
 
-      connectToElevenLabs(agentId, phone, sessionId);
+      connectToElevenLabs(agentId, phone, sessionId, profile_json);
       return;
     }
 
@@ -377,7 +389,7 @@ function attachBridgeHandlers(twilioWs, query = {}) {
     return null;
   }
 
-  async function connectToElevenLabs(agentId, phone, sessionId) {
+  async function connectToElevenLabs(agentId, phone, sessionId, profile_json) {
     const headers = { 'xi-api-key': ELEVENLABS_API_KEY };
 
     async function getSignedUrl() {
@@ -422,24 +434,25 @@ function attachBridgeHandlers(twilioWs, query = {}) {
         elReady = true; // optimistic
         log('EL_CONNECT','No metadata; proceeding optimistically',{ EL_READY_FALLBACK_MS });
         try { elWs.send(JSON.stringify({ type: "conversation_start" })); } catch {}
-        // push any already-buffered mic audio
         if (elBufferedFrames > 0) flushElBuffer('md-timeout');
       }
     }, Math.max(200, EL_READY_FALLBACK_MS));
 
+    // --- INIT: include dynamic_variables.profile when provided
+    const dynamicVars = {
+      caller_phone: phone || "",
+      mode,
+      session_id: sessionId,
+      timestamp: new Date().toISOString()
+    };
+    if (profile_json) dynamicVars.profile = profile_json;
+
     try {
       elWs.send(JSON.stringify({
         type: "conversation_initiation_client_data",
-        conversation_initiation_client_data: {
-          dynamic_variables: {
-            caller_phone: phone || "",
-            mode,
-            session_id: sessionId,
-            timestamp: new Date().toISOString()
-          }
-        }
+        conversation_initiation_client_data: { dynamic_variables: dynamicVars }
       }));
-      log('EL_SEND','Init data sent', { phone, mode });
+      log('EL_SEND','Init data sent', { phone, mode, hasProfile: !!profile_json });
     } catch (e) { log('ERROR','Init send failed', { error:e.message }); }
 
     elWs.on('message', (data) => {
